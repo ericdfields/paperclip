@@ -10,6 +10,7 @@ export type IssueWorkProductType =
 export type IssueWorkProductProvider =
   | "paperclip"
   | "github"
+  | "gitlab"
   | "vercel"
   | "s3"
   | "custom";
