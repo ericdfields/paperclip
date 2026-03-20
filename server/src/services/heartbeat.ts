@@ -55,6 +55,8 @@ import {
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import { workProductService } from "./work-products.js";
+import { detectPrFromLogChunk } from "./work-product-detection.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -701,6 +703,7 @@ export function heartbeatService(db: Db) {
   const issuesSvc = issueService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const workProductsSvc = workProductService(db);
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
@@ -2029,6 +2032,9 @@ export function heartbeatService(db: Db) {
         })
         .where(eq(heartbeatRuns.id, runId));
 
+      const prDetectionSeenUrls = new Set<string>();
+      const enablePrDetection = agent.adapterType === "claude_local" && issueId != null;
+
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = redactCurrentUserText(chunk);
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
@@ -2060,6 +2066,16 @@ export function heartbeatService(db: Db) {
             truncated: payloadChunk.length !== sanitizedChunk.length,
           },
         });
+
+        if (enablePrDetection && stream === "stdout") {
+          void detectPrFromLogChunk(chunk, {
+            issueId: issueId!,
+            companyId: run.companyId,
+            runId: run.id,
+            seenUrls: prDetectionSeenUrls,
+            workProductsSvc,
+          });
+        }
       };
       for (const warning of runtimeWorkspaceWarnings) {
         const logEntry = formatRuntimeWorkspaceWarningLog(warning);
