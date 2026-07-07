@@ -12,6 +12,7 @@ import { useToastActions } from "./ToastContext";
 import { upsertIssueCommentInPages } from "../lib/optimistic-issue-comments";
 import { clearIssueExecutionRun, removeLiveRunById } from "../lib/optimistic-issue-runs";
 import { queryKeys } from "../lib/queryKeys";
+import { setLiveConnected } from "../lib/liveConnection";
 import { toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
@@ -1024,7 +1025,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   }, [currentUserId]);
 
   useEffect(() => {
-    if (!canConnectSocket || !liveCompanyId) return;
+    if (!canConnectSocket || !liveCompanyId) {
+      setLiveConnected(false);
+      return;
+    }
 
     let closed = false;
     let reconnectAttempt = 0;
@@ -1065,6 +1069,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
           gateRef.current.suppressUntil = Date.now() + RECONNECT_SUPPRESS_MS;
         }
         reconnectAttempt = 0;
+        setLiveConnected(true);
       };
 
       nextSocket.onmessage = (message) => {
@@ -1090,6 +1095,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
       nextSocket.onclose = () => {
         if (socket !== nextSocket) return;
         socket = null;
+        setLiveConnected(false);
         if (closed) return;
         scheduleReconnect();
       };
@@ -1106,6 +1112,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
       clearReconnect();
       const activeSocket = socket;
       socket = null;
+      setLiveConnected(false);
       closeSocketQuietly(activeSocket, "provider_unmount");
     };
   }, [queryClient, liveCompanyId, pushToast, canConnectSocket, socketAuthKey]);
