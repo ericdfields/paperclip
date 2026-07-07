@@ -5,6 +5,7 @@ import { activityApi } from "../api/activity";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
+import { liveRefetchInterval } from "../lib/liveConnection";
 import { useCompany } from "../context/CompanyContext";
 import { FeedCard } from "./FeedCard";
 import { cn } from "../lib/utils";
@@ -337,12 +338,14 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
     document.head.appendChild(style);
   }, []);
 
-  // Fetch company-level activity, poll every 5s
+  // Fetch company-level activity. The live-updates socket invalidates this
+  // query on every activity.logged event, so polling backs off to a safety net
+  // while connected and resumes 5s cadence when the socket is down.
   const { data: activity } = useQuery({
     queryKey: queryKeys.activity(selectedCompanyId ?? ""),
     queryFn: () => activityApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
-    refetchInterval: 5000,
+    refetchInterval: liveRefetchInterval(5000),
   });
 
   // Fetch agents for name resolution + empty state

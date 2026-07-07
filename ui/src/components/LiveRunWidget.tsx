@@ -3,6 +3,7 @@ import { Link } from "@/lib/router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { heartbeatsApi, type LiveRunForIssue } from "../api/heartbeats";
 import { queryKeys } from "../lib/queryKeys";
+import { liveRefetchInterval } from "../lib/liveConnection";
 import { formatDateTime } from "../lib/utils";
 import { ExternalLink, Square } from "lucide-react";
 import { Identity } from "./Identity";
@@ -32,14 +33,14 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
     queryKey: queryKeys.issues.liveRuns(issueId),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
     enabled: !!issueId,
-    refetchInterval: 3000,
+    refetchInterval: liveRefetchInterval(3000),
   });
 
   const { data: activeRun } = useQuery({
     queryKey: queryKeys.issues.activeRun(issueId),
     queryFn: () => heartbeatsApi.activeRunForIssue(issueId),
     enabled: !!issueId,
-    refetchInterval: 3000,
+    refetchInterval: liveRefetchInterval(3000),
   });
 
   const runs = useMemo(() => {
