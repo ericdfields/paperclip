@@ -14896,6 +14896,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId
       ) {
+        // Siblings still drain before the blocked-recovery return, which would
+        // otherwise strand their parked wakes exactly like the other early
+        // returns did. The primary issue's own wakes are deliberately NOT
+        // drained here: this branch is about to park that issue blocked with a
+        // recovery comment, and promoting a run for the very issue being parked
+        // would race the recovery flow that owns its lifecycle. Promotions
+        // commit as queued runs inside this transaction; only the single-result
+        // side effects are skipped, as with other non-returned promotions.
+        await drainEligibleSiblingDeferredWakes(issue.id);
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
         return {
           kind: "blocked" as const,
