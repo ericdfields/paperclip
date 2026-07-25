@@ -57,6 +57,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import { isLoopbackHost, rewriteLocalUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -206,12 +207,6 @@ export async function startServer(): Promise<StartedServer> {
     return "applied (pending migrations)";
   }
   
-  function isLoopbackHost(host: string): boolean {
-    // Strip surrounding brackets so a URL hostname form ("[::1]") matches too.
-    const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
-    return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
-  }
-
   function isPostgresConnectionString(connectionString: string): boolean {
     try {
       const parsed = new URL(connectionString);
@@ -237,24 +232,6 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
-  function rewriteLocalUrlPort(rawUrl: string | undefined, port: number): string | undefined {
-    if (!rawUrl) return undefined;
-    try {
-      const parsed = new URL(rawUrl);
-      // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
-      if (!parsed.port) return rawUrl;
-      // Only rewrite the port for loopback hosts. An explicit external base URL (e.g. a
-      // Tailscale Serve listener on a non-default port like :8443) must survive untouched:
-      // rewriting its port to the internal listen port yields an unreachable URL (scheme/port
-      // mismatch) that then propagates to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
-      if (!isLoopbackHost(parsed.hostname)) return rawUrl;
-      parsed.port = String(port);
-      return parsed.toString();
-    } catch {
-      return rawUrl;
-    }
-  }
-  
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
   const LOCAL_BOARD_USER_NAME = "Board";

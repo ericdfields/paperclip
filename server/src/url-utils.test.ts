@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isLoopbackHost, rewriteLocalUrlPort } from "./worktree-config.js";
+import { isLoopbackHost, rewriteLocalUrlPort } from "./url-utils.js";
 
 describe("rewriteLocalUrlPort", () => {
   it("rewrites the port for loopback base URLs", () => {
