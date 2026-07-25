@@ -14575,16 +14575,308 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
 
-      // Deferred-wake promotion is bound to a single primary issue: the run's context
-      // issue when present, otherwise the first candidate we found (preserves the
-      // legacy rows[0] selection for runs that were not tied to a specific issue).
-      let issue =
+      // Deferred-wake promotion drains every candidate issue this run held, not
+      // just one: nothing else ever transitions `deferred_issue_execution` rows,
+      // so a wake parked against a skipped candidate is stranded forever (and the
+      // recovery reconciler counts it as an active execution path, suppressing
+      // its own safety net). The primary issue — the run's context issue when
+      // present, otherwise the first candidate we found (preserves the legacy
+      // rows[0] selection for runs that were not tied to a specific issue) —
+      // keeps its exact legacy drain semantics; the remaining candidates drain
+      // once the primary drain finds nothing to promote, and in the no-primary /
+      // repointed-primary cases that previously aborted the drain entirely.
+      const drainDeferredWakesForIssue = async (
+        candidateIssue: (typeof candidateIssues)[number],
+      ) => {
+        // The reopen path below swaps in the refreshed issue row, so track the
+        // drain target in a local mutable binding instead of mutating the
+        // caller's candidate.
+        let issue = candidateIssue;
+        while (true) {
+          const deferred = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(asc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+
+          if (!deferred) break;
+
+          const deferredAgent = await tx
+            .select()
+            .from(agents)
+            .where(eq(agents.id, deferred.agentId))
+            .then((rows) => rows[0] ?? null);
+
+          const companyAgents = deferredAgent
+            ? await tx
+              .select({
+                id: agents.id,
+                companyId: agents.companyId,
+                name: agents.name,
+                reportsTo: agents.reportsTo,
+                status: agents.status,
+              })
+              .from(agents)
+              .where(eq(agents.companyId, issue.companyId))
+            : [];
+          const deferredInvokability =
+            deferredAgent?.companyId === issue.companyId
+              ? evaluateAgentInvokability(deferredAgent, companyAgents)
+              : evaluateAgentInvokability(null, companyAgents);
+
+          if (!deferredAgent || deferredAgent.companyId !== issue.companyId || !deferredInvokability.invokable) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "failed",
+                finishedAt: new Date(),
+                error: "Deferred wake could not be promoted: agent is not invokable",
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const deferredPayload = parseObject(deferred.payload);
+          const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+          const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
+          const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            agentId: deferred.agentId,
+            contextSnapshot: deferredContextSeed,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+          });
+          if (activePauseHold && !treeHoldInteractionWake) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: new Date(),
+                error: "Deferred wake suppressed by active subtree pause hold",
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
+          if (activePauseHold) {
+            promotedContextSeed.treeHoldInteraction = true;
+            promotedContextSeed.activeTreeHold = {
+              holdId: activePauseHold.holdId,
+              rootIssueId: activePauseHold.rootIssueId,
+              mode: activePauseHold.mode,
+              reason: activePauseHold.reason,
+              releasePolicy: activePauseHold.releasePolicy,
+              interaction: true,
+            };
+          }
+          const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
+          const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+          // Local-CLI agents post comments under user auth, so a self-comment from
+          // the run that is now ending would otherwise look like a real human
+          // comment and trigger a reopen on the very issue this run just closed.
+          // Suppress reopen only when every referenced comment came from this run;
+          // mixed batches must still reopen because they contain a real follow-up.
+          let deferredCommentWakeIsSelfAuthored = false;
+          if (deferredCommentIds.length > 0) {
+            const deferredComments = await tx
+              .select({ createdByRunId: issueComments.createdByRunId })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.companyId, issue.companyId),
+                  eq(issueComments.issueId, issue.id),
+                  inArray(issueComments.id, deferredCommentIds),
+                ),
+              )
+              .then((rows) => rows);
+            deferredCommentWakeIsSelfAuthored =
+              deferredComments.length > 0 &&
+              deferredComments.every((comment) => comment.createdByRunId === run.id);
+          }
+          // Only human/comment-reopen interactions should revive completed issues;
+          // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+          const shouldReopenDeferredCommentWake =
+            deferredCommentIds.length > 0 &&
+            !deferredCommentWakeIsSelfAuthored &&
+            (issue.status === "done" || issue.status === "cancelled") &&
+            (
+              deferred.requestedByActorType === "user" ||
+              deferredWakeReason === "issue_reopened_via_comment"
+            );
+          let reopenedActivity: LogActivityInput | null = null;
+
+          if (shouldReopenDeferredCommentWake) {
+            const reopenedFromStatus = issue.status;
+            const reopenedIssue = await issuesSvc.update(
+              issue.id,
+              {
+                status: "todo",
+                executionState: null,
+              },
+              tx,
+            );
+            if (reopenedIssue) {
+              issue = {
+                ...issue,
+                identifier: reopenedIssue.identifier,
+                status: reopenedIssue.status,
+                executionRunId: reopenedIssue.executionRunId,
+              };
+              if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
+                promotedContextSeed.reopenedFrom = reopenedFromStatus;
+              }
+              reopenedActivity = {
+                companyId: issue.companyId,
+                actorType: "system",
+                actorId: "heartbeat",
+                agentId: deferred.agentId,
+                runId: run.id,
+                action: "issue.updated",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  status: "todo",
+                  reopened: true,
+                  reopenedFrom: reopenedFromStatus,
+                  source: "deferred_comment_wake",
+                  identifier: issue.identifier,
+                },
+              };
+            }
+          }
+
+          const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
+          const promotedSource =
+            (readNonEmptyString(deferred.source) as WakeupOptions["source"]) ?? "automation";
+          const promotedTriggerDetail =
+            (readNonEmptyString(deferred.triggerDetail) as WakeupOptions["triggerDetail"]) ?? null;
+          const promotedPayload = deferredPayload;
+          delete promotedPayload[DEFERRED_WAKE_CONTEXT_KEY];
+
+          const {
+            contextSnapshot: promotedContextSnapshot,
+            taskKey: promotedTaskKey,
+          } = enrichWakeContextSnapshot({
+            contextSnapshot: promotedContextSeed,
+            reason: promotedReason,
+            source: promotedSource,
+            triggerDetail: promotedTriggerDetail,
+            payload: promotedPayload,
+          });
+
+          const sessionBefore =
+            readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??
+            await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
+          const promotedContinuationAttempt = readContinuationAttempt(
+            promotedContextSnapshot.livenessContinuationAttempt,
+          );
+          const promotedResponsibleUserId = await resolveResponsibleUserIdForRunSeed({
+            companyId: deferredAgent.companyId,
+            contextSnapshot: promotedContextSnapshot,
+            issueContext: issue,
+            routineEnvContext: await getRoutineEnvForExecutionIssue(deferredAgent.companyId, issue),
+            requestedByActorType: deferred.requestedByActorType as "user" | "agent" | "system" | null,
+            requestedByActorId: deferred.requestedByActorId,
+            source: promotedSource,
+            triggerDetail: promotedTriggerDetail,
+            existingRunResponsibleUserId: run.responsibleUserId,
+          });
+          if (!promotedResponsibleUserId) {
+            throw new HttpError(422, "Unable to resolve responsible user for promoted heartbeat run", {
+              code: "responsible_user_unresolved",
+              runId: run.id,
+              agentId: deferredAgent.id,
+              companyId: deferredAgent.companyId,
+              issueId: issue.id,
+              wakeReason: readNonEmptyString(promotedContextSnapshot.wakeReason),
+            });
+          }
+          const now = new Date();
+          const newRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: deferredAgent.companyId,
+              agentId: deferredAgent.id,
+              invocationSource: promotedSource,
+              triggerDetail: promotedTriggerDetail,
+              status: "queued",
+              wakeupRequestId: deferred.id,
+              contextSnapshot: promotedContextSnapshot,
+              responsibleUserId: promotedResponsibleUserId,
+              sessionIdBefore: sessionBefore,
+              continuationAttempt: promotedContinuationAttempt,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "queued",
+              reason: "issue_execution_promoted",
+              runId: newRun.id,
+              claimedAt: null,
+              finishedAt: null,
+              error: null,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: newRun.id,
+              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            // Promoted mention wakes are issue-scoped, not issue ownership transfers.
+            .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, deferredAgent.id)));
+
+          return {
+            kind: "promoted" as const,
+            run: newRun,
+            reopenedActivity,
+          };
+        }
+        return null;
+      };
+
+      // Candidates whose executionRunId moved to another live run were repointed
+      // to a retry mid-finalization; that retry drains them at its own
+      // finalization, and promoting them here would race it into a duplicate
+      // execution path for the same issue.
+      const drainEligibleSiblingDeferredWakes = async (primaryIssueId: string | null) => {
+        for (const candidate of candidateIssues) {
+          if (primaryIssueId && candidate.id === primaryIssueId) continue;
+          if (candidate.executionRunId && candidate.executionRunId !== run.id) continue;
+          const promoted = await drainDeferredWakesForIssue(candidate);
+          if (promoted) return promoted;
+        }
+        return null;
+      };
+
+      const issue =
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
 
-      if (!issue) return null;
-      if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      if (!issue) return drainEligibleSiblingDeferredWakes(null);
+      if (issue.executionRunId && issue.executionRunId !== run.id) {
+        return drainEligibleSiblingDeferredWakes(issue.id);
+      }
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
@@ -14610,266 +14902,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      const promotedFromPrimaryIssue = await drainDeferredWakesForIssue(issue);
+      if (promotedFromPrimaryIssue) return promotedFromPrimaryIssue;
 
-      while (true) {
-        const deferred = await tx
-          .select()
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, issue.companyId),
-              eq(agentWakeupRequests.status, "deferred_issue_execution"),
-              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
-            ),
-          )
-          .orderBy(asc(agentWakeupRequests.requestedAt))
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-
-        if (!deferred) break;
-
-        const deferredAgent = await tx
-          .select()
-          .from(agents)
-          .where(eq(agents.id, deferred.agentId))
-          .then((rows) => rows[0] ?? null);
-
-        const companyAgents = deferredAgent
-          ? await tx
-            .select({
-              id: agents.id,
-              companyId: agents.companyId,
-              name: agents.name,
-              reportsTo: agents.reportsTo,
-              status: agents.status,
-            })
-            .from(agents)
-            .where(eq(agents.companyId, issue.companyId))
-          : [];
-        const deferredInvokability =
-          deferredAgent?.companyId === issue.companyId
-            ? evaluateAgentInvokability(deferredAgent, companyAgents)
-            : evaluateAgentInvokability(null, companyAgents);
-
-        if (!deferredAgent || deferredAgent.companyId !== issue.companyId || !deferredInvokability.invokable) {
-          await tx
-            .update(agentWakeupRequests)
-            .set({
-              status: "failed",
-              finishedAt: new Date(),
-              error: "Deferred wake could not be promoted: agent is not invokable",
-              updatedAt: new Date(),
-            })
-            .where(eq(agentWakeupRequests.id, deferred.id));
-          continue;
-        }
-
-        const deferredPayload = parseObject(deferred.payload);
-        const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
-        const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
-        const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
-          companyId: issue.companyId,
-          issueId: issue.id,
-          agentId: deferred.agentId,
-          contextSnapshot: deferredContextSeed,
-          requestedByActorType: deferred.requestedByActorType,
-          requestedByActorId: deferred.requestedByActorId,
-        });
-        if (activePauseHold && !treeHoldInteractionWake) {
-          await tx
-            .update(agentWakeupRequests)
-            .set({
-              status: "cancelled",
-              finishedAt: new Date(),
-              error: "Deferred wake suppressed by active subtree pause hold",
-              updatedAt: new Date(),
-            })
-            .where(eq(agentWakeupRequests.id, deferred.id));
-          continue;
-        }
-
-        const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
-        if (activePauseHold) {
-          promotedContextSeed.treeHoldInteraction = true;
-          promotedContextSeed.activeTreeHold = {
-            holdId: activePauseHold.holdId,
-            rootIssueId: activePauseHold.rootIssueId,
-            mode: activePauseHold.mode,
-            reason: activePauseHold.reason,
-            releasePolicy: activePauseHold.releasePolicy,
-            interaction: true,
-          };
-        }
-        const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
-        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Local-CLI agents post comments under user auth, so a self-comment from
-        // the run that is now ending would otherwise look like a real human
-        // comment and trigger a reopen on the very issue this run just closed.
-        // Suppress reopen only when every referenced comment came from this run;
-        // mixed batches must still reopen because they contain a real follow-up.
-        let deferredCommentWakeIsSelfAuthored = false;
-        if (deferredCommentIds.length > 0) {
-          const deferredComments = await tx
-            .select({ createdByRunId: issueComments.createdByRunId })
-            .from(issueComments)
-            .where(
-              and(
-                eq(issueComments.companyId, issue.companyId),
-                eq(issueComments.issueId, issue.id),
-                inArray(issueComments.id, deferredCommentIds),
-              ),
-            )
-            .then((rows) => rows);
-          deferredCommentWakeIsSelfAuthored =
-            deferredComments.length > 0 &&
-            deferredComments.every((comment) => comment.createdByRunId === run.id);
-        }
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 &&
-          !deferredCommentWakeIsSelfAuthored &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
-        let reopenedActivity: LogActivityInput | null = null;
-
-        if (shouldReopenDeferredCommentWake) {
-          const reopenedFromStatus = issue.status;
-          const reopenedIssue = await issuesSvc.update(
-            issue.id,
-            {
-              status: "todo",
-              executionState: null,
-            },
-            tx,
-          );
-          if (reopenedIssue) {
-            issue = {
-              ...issue,
-              identifier: reopenedIssue.identifier,
-              status: reopenedIssue.status,
-              executionRunId: reopenedIssue.executionRunId,
-            };
-            if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
-              promotedContextSeed.reopenedFrom = reopenedFromStatus;
-            }
-            reopenedActivity = {
-              companyId: issue.companyId,
-              actorType: "system",
-              actorId: "heartbeat",
-              agentId: deferred.agentId,
-              runId: run.id,
-              action: "issue.updated",
-              entityType: "issue",
-              entityId: issue.id,
-              details: {
-                status: "todo",
-                reopened: true,
-                reopenedFrom: reopenedFromStatus,
-                source: "deferred_comment_wake",
-                identifier: issue.identifier,
-              },
-            };
-          }
-        }
-
-        const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
-        const promotedSource =
-          (readNonEmptyString(deferred.source) as WakeupOptions["source"]) ?? "automation";
-        const promotedTriggerDetail =
-          (readNonEmptyString(deferred.triggerDetail) as WakeupOptions["triggerDetail"]) ?? null;
-        const promotedPayload = deferredPayload;
-        delete promotedPayload[DEFERRED_WAKE_CONTEXT_KEY];
-
-        const {
-          contextSnapshot: promotedContextSnapshot,
-          taskKey: promotedTaskKey,
-        } = enrichWakeContextSnapshot({
-          contextSnapshot: promotedContextSeed,
-          reason: promotedReason,
-          source: promotedSource,
-          triggerDetail: promotedTriggerDetail,
-          payload: promotedPayload,
-        });
-
-        const sessionBefore =
-          readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??
-          await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
-        const promotedContinuationAttempt = readContinuationAttempt(
-          promotedContextSnapshot.livenessContinuationAttempt,
-        );
-        const promotedResponsibleUserId = await resolveResponsibleUserIdForRunSeed({
-          companyId: deferredAgent.companyId,
-          contextSnapshot: promotedContextSnapshot,
-          issueContext: issue,
-          routineEnvContext: await getRoutineEnvForExecutionIssue(deferredAgent.companyId, issue),
-          requestedByActorType: deferred.requestedByActorType as "user" | "agent" | "system" | null,
-          requestedByActorId: deferred.requestedByActorId,
-          source: promotedSource,
-          triggerDetail: promotedTriggerDetail,
-          existingRunResponsibleUserId: run.responsibleUserId,
-        });
-        if (!promotedResponsibleUserId) {
-          throw new HttpError(422, "Unable to resolve responsible user for promoted heartbeat run", {
-            code: "responsible_user_unresolved",
-            runId: run.id,
-            agentId: deferredAgent.id,
-            companyId: deferredAgent.companyId,
-            issueId: issue.id,
-            wakeReason: readNonEmptyString(promotedContextSnapshot.wakeReason),
-          });
-        }
-        const now = new Date();
-        const newRun = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: deferredAgent.companyId,
-            agentId: deferredAgent.id,
-            invocationSource: promotedSource,
-            triggerDetail: promotedTriggerDetail,
-            status: "queued",
-            wakeupRequestId: deferred.id,
-            contextSnapshot: promotedContextSnapshot,
-            responsibleUserId: promotedResponsibleUserId,
-            sessionIdBefore: sessionBefore,
-            continuationAttempt: promotedContinuationAttempt,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            status: "queued",
-            reason: "issue_execution_promoted",
-            runId: newRun.id,
-            claimedAt: null,
-            finishedAt: null,
-            error: null,
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, deferred.id));
-
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          // Promoted mention wakes are issue-scoped, not issue ownership transfers.
-          .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, deferredAgent.id)));
-
-        return {
-          kind: "promoted" as const,
-          run: newRun,
-          reopenedActivity,
-        };
-      }
+      const promotedFromSiblingIssue = await drainEligibleSiblingDeferredWakes(issue.id);
+      if (promotedFromSiblingIssue) return promotedFromSiblingIssue;
 
       const findExistingExecutionPath = (agentId?: string | null) =>
         tx
