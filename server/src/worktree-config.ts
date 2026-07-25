@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { PaperclipConfig } from "@paperclipai/shared";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
-import { rewriteLocalUrlPort } from "./url-utils.js";
+import { rewriteUrlPort } from "./url-utils.js";
 
 function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -375,7 +375,7 @@ function buildIsolatedWorktreeConfig(
   if (config.auth.baseUrlMode === "explicit" && config.auth.publicBaseUrl) {
     nextConfig.auth = {
       ...config.auth,
-      publicBaseUrl: rewriteLocalUrlPort(config.auth.publicBaseUrl, serverPort),
+      publicBaseUrl: rewriteUrlPort(config.auth.publicBaseUrl, serverPort),
     };
   }
 
@@ -448,7 +448,7 @@ export function applyRuntimePortSelectionToConfig(
   }
 
   if (nextConfig.auth.baseUrlMode === "explicit" && nextConfig.auth.publicBaseUrl) {
-    const rewritten = rewriteLocalUrlPort(nextConfig.auth.publicBaseUrl, input.serverPort);
+    const rewritten = rewriteUrlPort(nextConfig.auth.publicBaseUrl, input.serverPort);
     if (rewritten && rewritten !== nextConfig.auth.publicBaseUrl) {
       nextConfig = {
         ...nextConfig,
