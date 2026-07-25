@@ -14859,13 +14859,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // finalization, and promoting them here would race it into a duplicate
       // execution path for the same issue.
       const drainEligibleSiblingDeferredWakes = async (primaryIssueId: string | null) => {
+        // Drain every eligible sibling, not just until the first promotion.
+        // Per-issue chains are self-sustaining (a promoted run re-drains its
+        // own issue when it finalizes), but that chain never reaches *other*
+        // sibling issues of this run — stopping early would strand their
+        // deferred wakes permanently. Only the first promotion is returned
+        // because the caller's contract surfaces a single result; the rest
+        // are ordinary queued runs picked up by the scheduler.
+        let firstPromoted: Awaited<ReturnType<typeof drainDeferredWakesForIssue>> = null;
         for (const candidate of candidateIssues) {
           if (primaryIssueId && candidate.id === primaryIssueId) continue;
           if (candidate.executionRunId && candidate.executionRunId !== run.id) continue;
           const promoted = await drainDeferredWakesForIssue(candidate);
-          if (promoted) return promoted;
+          if (promoted && !firstPromoted) firstPromoted = promoted;
         }
-        return null;
+        return firstPromoted;
       };
 
       const issue =
@@ -14902,10 +14910,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      // Siblings drain even when the primary issue promotes: a primary
+      // promotion only continues the primary issue's own chain and would
+      // otherwise strand sibling-parked wakes just like the early returns did.
       const promotedFromPrimaryIssue = await drainDeferredWakesForIssue(issue);
-      if (promotedFromPrimaryIssue) return promotedFromPrimaryIssue;
-
       const promotedFromSiblingIssue = await drainEligibleSiblingDeferredWakes(issue.id);
+      if (promotedFromPrimaryIssue) return promotedFromPrimaryIssue;
       if (promotedFromSiblingIssue) return promotedFromSiblingIssue;
 
       const findExistingExecutionPath = (agentId?: string | null) =>
