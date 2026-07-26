@@ -12,9 +12,11 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY } from "../services/recovery/index.ts";
+import { LOW_TRUST_QUARANTINED_BODY } from "../services/source-trust.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -2978,6 +2980,462 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           .then((rows) => rows[0] ?? null);
         return run?.status === "succeeded";
       }, 90_000);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
+  it("quotes the pending comment content in the blocked-recovery comment when workspace validation fails", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const primaryIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+    const strandedFeedbackBody =
+      "Founder rejected this: the pricing copy on the landing page still says $99 instead of $79 — please fix before shipping.";
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: primaryIssueId,
+        companyId,
+        title: "Primary issue with a real pending comment",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const primaryComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorUserId: "user-1",
+          body: "Start primary work",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: primaryComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: primaryComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      // The stranded comment carries real, distinctive content — the thing a
+      // human would otherwise have to reconstruct from scratch (BRO-1501).
+      const strandedFeedbackComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorUserId: "founder-user",
+          body: strandedFeedbackBody,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const strandedDeferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: strandedFeedbackComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: strandedFeedbackComment.id,
+          wakeCommentId: strandedFeedbackComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "founder-user",
+      });
+      expect(strandedDeferredRun).toBeNull();
+
+      const deferredWake = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(deferredWake).not.toBeNull();
+      expect(deferredWake?.payload).toMatchObject({ issueId: primaryIssueId });
+
+      // Finalize the run as a workspace-validation failure, which routes the
+      // primary issue into the blocked-recovery branch and fails out its own
+      // pending deferred wake (round 3's fix).
+      await heartbeat.cancelRun(
+        firstRun!.id,
+        "workspace validation failed before dispatch",
+        { errorCode: "workspace_validation_failed" },
+      );
+
+      // Round 3's behavior must still hold: the wake is terminalized, not
+      // left stranded in `deferred_issue_execution`.
+      const wakeAfterRelease = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWake!.id))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeAfterRelease?.status).toBe("failed");
+      expect(wakeAfterRelease?.status).not.toBe("deferred_issue_execution");
+      expect(wakeAfterRelease?.finishedAt).not.toBeNull();
+      expect(wakeAfterRelease?.error).toBeTruthy();
+
+      // Round 4: the blocked-recovery comment must quote the actual content
+      // of the stranded comment, not just the generic explanation.
+      const primaryAfterRelease = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, primaryIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(primaryAfterRelease?.status).toBe("blocked");
+
+      const primaryComments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, primaryIssueId));
+      const recoveryComment = primaryComments.find((comment) =>
+        comment.body.includes("issue workspace failed validation"),
+      );
+      expect(recoveryComment).not.toBeUndefined();
+      expect(recoveryComment?.body).toContain("Pending feedback that could not be delivered");
+      expect(recoveryComment?.body).toContain(strandedFeedbackBody);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
+  it("redacts a quarantined stranded comment's body instead of quoting it verbatim in the blocked-recovery comment", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const primaryIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+    const quarantinedFeedbackBody =
+      "This body must never reach the recovery comment verbatim — it is quarantined low-trust output.";
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: primaryIssueId,
+        companyId,
+        title: "Primary issue with a quarantined pending comment",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const primaryComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorUserId: "user-1",
+          body: "Start primary work",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: primaryComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: primaryComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const quarantinedComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorAgentId: agentId,
+          body: quarantinedFeedbackBody,
+          sourceTrust: {
+            preset: LOW_TRUST_REVIEW_PRESET,
+            disposition: "quarantined",
+            sourceIssueId: primaryIssueId,
+          },
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const quarantinedDeferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: quarantinedComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: quarantinedComment.id,
+          wakeCommentId: quarantinedComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "agent",
+        requestedByActorId: agentId,
+      });
+      expect(quarantinedDeferredRun).toBeNull();
+
+      await heartbeat.cancelRun(
+        firstRun!.id,
+        "workspace validation failed before dispatch",
+        { errorCode: "workspace_validation_failed" },
+      );
+
+      const primaryAfterRelease = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, primaryIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(primaryAfterRelease?.status).toBe("blocked");
+
+      const primaryComments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, primaryIssueId));
+      const recoveryComment = primaryComments.find((comment) =>
+        comment.body.includes("issue workspace failed validation"),
+      );
+      expect(recoveryComment).not.toBeUndefined();
+      // The real quarantined body must never appear, redacted or not.
+      expect(recoveryComment?.body).not.toContain(quarantinedFeedbackBody);
+      // Mirroring redactQuarantinedBodyForHigherTrust elsewhere in the file:
+      // the pending-feedback section still appears, but with the placeholder
+      // in place of the real content.
+      expect(recoveryComment?.body).toContain("Pending feedback that could not be delivered");
+      expect(recoveryComment?.body).toContain(LOW_TRUST_QUARANTINED_BODY);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
+  it("excludes a soft-deleted stranded comment from the blocked-recovery comment entirely", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const primaryIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+    const deletedFeedbackBody = "This comment was deleted and must not be resurrected into a new comment.";
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: primaryIssueId,
+        companyId,
+        title: "Primary issue with a soft-deleted pending comment",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const primaryComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorUserId: "user-1",
+          body: "Start primary work",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: primaryComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: primaryComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const deletedComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId: primaryIssueId,
+          authorUserId: "user-1",
+          body: deletedFeedbackBody,
+          deletedAt: new Date(),
+          deletedByType: "user",
+          deletedByUserId: "user-1",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const deletedDeferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: deletedComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: deletedComment.id,
+          wakeCommentId: deletedComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+      expect(deletedDeferredRun).toBeNull();
+
+      await heartbeat.cancelRun(
+        firstRun!.id,
+        "workspace validation failed before dispatch",
+        { errorCode: "workspace_validation_failed" },
+      );
+
+      const primaryAfterRelease = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, primaryIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(primaryAfterRelease?.status).toBe("blocked");
+
+      const primaryComments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, primaryIssueId));
+      const recoveryComment = primaryComments.find((comment) =>
+        comment.body.includes("issue workspace failed validation"),
+      );
+      expect(recoveryComment).not.toBeUndefined();
+      // A soft-deleted comment is excluded entirely: no placeholder, no
+      // pending-feedback section at all, since it was the only stranded
+      // comment on this issue.
+      expect(recoveryComment?.body).not.toContain(deletedFeedbackBody);
+      expect(recoveryComment?.body).not.toContain("Pending feedback that could not be delivered");
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

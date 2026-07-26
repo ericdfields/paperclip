@@ -14434,25 +14434,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  // Cap on how much of a stranded comment's body gets quoted into a
+  // blocked-recovery comment: enough for a human to see what was actually
+  // said, not so much that one long comment turns the recovery comment into
+  // a wall of text.
+  const PENDING_WAKE_COMMENT_EXCERPT_MAX_CHARS = 500;
+
+  function truncateForRecoveryComment(body: string | null | undefined) {
+    const trimmed = readNonEmptyString(body)?.trim();
+    if (!trimmed) return null;
+    return trimmed.length > PENDING_WAKE_COMMENT_EXCERPT_MAX_CHARS
+      ? `${trimmed.slice(0, PENDING_WAKE_COMMENT_EXCERPT_MAX_CHARS)}...`
+      : trimmed;
+  }
+
+  // BRO-1501: a deferred wake being failed out (instead of promoted) still
+  // carried a real human comment. Quoting it here is what stands between a
+  // human reading the recovery comment and having to reconstruct the lost
+  // feedback from scratch — see the primary-issue fail-out block in
+  // releaseIssueExecutionAndPromote.
+  function formatPendingCommentsRecoverySection(pendingComments: string[] | undefined) {
+    if (!pendingComments || pendingComments.length === 0) return "";
+    const quoted = pendingComments
+      .map((comment) => comment.split("\n").map((line) => `> ${line}`).join("\n"))
+      .join("\n\n");
+    return `\n\n**Pending feedback that could not be delivered:**\n\n${quoted}`;
+  }
+
   function buildWorkspaceValidationRecoveryComment(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    pendingComments?: string[];
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
     return (
       "Paperclip stopped before launching the local adapter because the issue workspace failed validation. " +
       `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming."
+      "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming." +
+      formatPendingCommentsRecoverySection(input.pendingComments)
     );
   }
 
   function buildConfigurationIncompleteRecoveryComment(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    pendingComments?: string[];
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
     return (
       "Paperclip stopped before dispatching the adapter because required secret/env bindings are missing. " +
       `Resolving them as a runtime failure would only produce repeated opaque setup failures.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so an operator can bind the missing secret(s) before resuming."
+      "Moving it to `blocked` with a source-scoped recovery action so an operator can bind the missing secret(s) before resuming." +
+      formatPendingCommentsRecoverySection(input.pendingComments)
     );
   }
 
@@ -14913,6 +14944,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // them out explicitly, matching the same terminalization pattern used
         // for ineligible wakes inside the drain loop above, so a wake parked
         // on the very issue we're about to block doesn't strand forever.
+        //
+        // Failing the row silently would still drop whatever a human actually
+        // said (BRO-1501): pull the comment ids each pending wake was
+        // carrying — same extraction + fetch shape drainDeferredWakesForIssue
+        // uses above for self-authored-reopen detection — so the
+        // blocked-recovery comment can quote the real content instead of a
+        // human having to reconstruct it from scratch.
+        const primaryPendingDeferredWakes = await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            ),
+          )
+          .orderBy(asc(agentWakeupRequests.requestedAt));
+
+        const primaryPendingCommentIds = [
+          ...new Set(
+            primaryPendingDeferredWakes.flatMap((wake) =>
+              extractWakeCommentIds(parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY])),
+            ),
+          ),
+        ];
+        const primaryPendingComments = primaryPendingCommentIds.length > 0
+          ? await tx
+            .select({
+              id: issueComments.id,
+              body: issueComments.body,
+              deletedAt: issueComments.deletedAt,
+              sourceTrust: issueComments.sourceTrust,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, primaryPendingCommentIds),
+              ),
+            )
+          : [];
+        const primaryPendingCommentExcerpts = primaryPendingComments
+          // A soft-deleted comment must not be resurrected into a new
+          // permanent recovery comment at all — skip it outright, not even
+          // as a placeholder.
+          .filter((comment) => !comment.deletedAt)
+          // Quarantined low-trust bodies must never reach a higher-trust
+          // recovery comment verbatim; redact the same way every other
+          // body-quoting path in this file does (e.g. the inline wake
+          // payload builder above) before it gets truncated for display.
+          .map((comment) => redactQuarantinedBodyForHigherTrust(comment))
+          .map((comment) => truncateForRecoveryComment(comment.body))
+          .filter((excerpt): excerpt is string => Boolean(excerpt));
+
         await tx
           .update(agentWakeupRequests)
           .set({
@@ -14936,8 +15023,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issue,
           previousStatus: issue.status,
           comment: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
+            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run, pendingComments: primaryPendingCommentExcerpts })
+            : buildWorkspaceValidationRecoveryComment({ latestRun: run, pendingComments: primaryPendingCommentExcerpts }),
           recoveryCause: configurationIncomplete
             ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
             : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
