@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ClipboardCheck, Loader2, ShieldCheck } from "lucide-react";
 import type { Issue, IssueExecutionStageType } from "@paperclipai/shared";
 
@@ -92,6 +92,13 @@ export function IssueExecutionDecisionCard({
   );
   const [activeKey, setActiveKey] = useState<string | null>(decisionKey);
 
+  // Always holds the latest decision identity for in-flight async handlers to
+  // read (a closure captures the key of the render it was created in, which
+  // goes stale after a stage advance). Updating a ref during render is React's
+  // documented "latest value" escape hatch and is safe here.
+  const decisionKeyRef = useRef(decisionKey);
+  decisionKeyRef.current = decisionKey;
+
   // Reset the in-progress comment when the decision target changes, so text
   // typed for one stage/issue can never be submitted against another. Adjusting
   // state during render (React's documented "store info from previous renders"
@@ -113,11 +120,17 @@ export function IssueExecutionDecisionCard({
     handler: (comment: string) => Promise<unknown> | void,
   ) {
     if (!canSubmit) return;
+    // Capture the decision this run belongs to. If the issue advances to another
+    // pending stage while this PATCH is in flight, the render-time reset already
+    // clears `working` for the new stage; without this guard the stale run's
+    // `finally` would then clear the NEW run's `working`, re-enabling the buttons
+    // mid-submit and allowing a duplicate decision.
+    const startedKey = decisionKey;
     setWorking(action);
     try {
       await handler(trimmed);
     } finally {
-      setWorking(null);
+      if (decisionKeyRef.current === startedKey) setWorking(null);
     }
   }
 

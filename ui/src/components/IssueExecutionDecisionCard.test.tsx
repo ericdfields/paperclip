@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import type { Issue, IssueExecutionState } from "@paperclipai/shared";
@@ -291,6 +292,82 @@ describe("IssueExecutionDecisionCard rendering", () => {
       ),
     );
     expect(onApprove).not.toHaveBeenCalled();
+
+    flushSync(() => root.unmount());
+  });
+
+  it("does not let a stale in-flight decision re-enable the buttons after a stage advance", async () => {
+    // Both decisions' PATCHes stay pending until we resolve them by hand, so we
+    // can observe the first resolving while the second is still in flight.
+    let resolveFirst!: () => void;
+    const firstPending = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const secondPending = new Promise<void>(() => {
+      // never resolves during this test — the second decision stays in flight.
+    });
+    const onApprove = vi
+      .fn()
+      .mockReturnValueOnce(firstPending)
+      .mockReturnValueOnce(secondPending);
+    const root = createRoot(container);
+
+    // Reviewer approves on issue-1 / stage-1; the PATCH is now in flight.
+    flushSync(() => {
+      root.render(
+        <IssueExecutionDecisionCard
+          issue={issueWith(stateWith({}), "issue-1")}
+          currentUserId={VIEWER}
+          onApprove={onApprove}
+          onRequestChanges={vi.fn()}
+        />,
+      );
+    });
+    typeComment("Approving issue one.");
+    flushSync(() =>
+      findButton("Approve")!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      ),
+    );
+    expect(onApprove).toHaveBeenCalledTimes(1);
+
+    // Realtime advance to a new pending stage while the first PATCH is unresolved.
+    flushSync(() => {
+      root.render(
+        <IssueExecutionDecisionCard
+          issue={issueWith(
+            stateWith({ currentStageId: "stage-2", currentStageType: "approval" }),
+            "issue-2",
+          )}
+          currentUserId={VIEWER}
+          onApprove={onApprove}
+          onRequestChanges={vi.fn()}
+        />,
+      );
+    });
+
+    // Reviewer starts a fresh decision on the new stage; its PATCH is in flight.
+    typeComment("Approving issue two.");
+    flushSync(() =>
+      findButton("Approve")!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      ),
+    );
+    expect(onApprove).toHaveBeenCalledTimes(2);
+    // The second run is submitting: the primary button shows its working label
+    // ("Approving…") and is disabled.
+    expect(findButton("Approving")).toBeTruthy();
+    expect(findButton("Approving")!.disabled).toBe(true);
+
+    // The stale first PATCH now resolves. Its finally must NOT clear the second
+    // run's working state — the button stays in its disabled "Approving…" state,
+    // blocking a duplicate submission.
+    await act(async () => {
+      resolveFirst();
+      await firstPending;
+    });
+    expect(findButton("Approving")).toBeTruthy();
+    expect(findButton("Approving")!.disabled).toBe(true);
 
     flushSync(() => root.unmount());
   });
