@@ -1900,21 +1900,23 @@ function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (
-    input.interaction.continuationPolicy !== "wake_assignee"
-    && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
-  ) return;
-  if (
-    input.interaction.continuationPolicy === "wake_assignee_on_accept"
-    && input.interaction.status !== "accepted"
-  ) return;
+  const interactionResult = readConfirmationResultForWake(input.interaction.result);
+  // A rejection that carries a reason is a message, not silence — the requester needs
+  // it regardless of continuationPolicy. Policies like "none" or "wake_assignee_on_accept"
+  // exist to control noise on the accept path; they were never meant to suppress feedback
+  // the requester is actively waiting to hear. Without this, a reasoned decline silently
+  // vanishes (paperclipai/paperclip#8617, #6800).
+  const isRejectionWithReason = input.interaction.status === "rejected" && !!interactionResult?.reason;
+  const policyAllowsWake =
+    input.interaction.continuationPolicy === "wake_assignee"
+    || (input.interaction.continuationPolicy === "wake_assignee_on_accept" && input.interaction.status === "accepted");
+  if (!policyAllowsWake && !isRejectionWithReason) return;
   if (input.interaction.status === "expired") return;
   if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
 
   const forceFreshSession = input.forceFreshSession === true;
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
-  const interactionResult = readConfirmationResultForWake(input.interaction.result);
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
   const toolAction = readToolActionContinuationContext(input.interaction);
   const newlyResolvedItemIds = input.newlyResolvedItemIds?.filter((value) => value.length > 0) ?? [];
@@ -1950,6 +1952,10 @@ function queueResolvedInteractionContinuationWakeup(input: {
       ...(checkboxSelection ? { checkboxSelection } : {}),
       ...(toolAction ? { toolAction } : {}),
       ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
+      // Surfaced at the top level (in addition to any kind-specific structure above)
+      // so the woken agent sees the actual feedback without a follow-up fetch — the
+      // entire point of overriding a silent continuationPolicy for this case.
+      ...(isRejectionWithReason ? { rejectionReason: interactionResult!.reason } : {}),
       mutation: "interaction",
     },
     idempotencyKey: input.idempotencyKey ?? null,
@@ -1967,6 +1973,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
       ...(checkboxSelection ? { checkboxSelection } : {}),
       ...(toolAction ? { toolAction } : {}),
       ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
+      ...(isRejectionWithReason ? { rejectionReason: interactionResult!.reason } : {}),
       wakeReason: "issue_commented",
       source: input.source,
       ...(forceFreshSession ? { forceFreshSession: true } : {}),
