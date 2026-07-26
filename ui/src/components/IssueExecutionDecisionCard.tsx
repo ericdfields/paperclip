@@ -35,7 +35,8 @@ export function getPendingExecutionDecision(
   if (!state || state.status !== "pending") return null;
 
   const participant = state.currentParticipant;
-  if (!participant || participant.type !== "user" || !participant.userId) return null;
+  if (!participant || participant.type !== "user" || !participant.userId)
+    return null;
   if (!currentUserId || participant.userId !== currentUserId) return null;
 
   return {
@@ -76,8 +77,30 @@ export function IssueExecutionDecisionCard({
   onRequestChanges,
 }: IssueExecutionDecisionCardProps) {
   const decision = getPendingExecutionDecision(issue, currentUserId);
+
+  // Identity of the decision this card is currently editing. Changes when the
+  // viewer navigates to a different actionable issue OR realtime data advances
+  // this issue to another pending stage — both of which can reuse this same
+  // component instance without a remount (e.g. same tree position, no `key`).
+  const decisionKey = decision
+    ? `${issue.id}::${issue.executionState?.currentStageId ?? ""}`
+    : null;
+
   const [comment, setComment] = useState("");
-  const [working, setWorking] = useState<"approve" | "request_changes" | null>(null);
+  const [working, setWorking] = useState<"approve" | "request_changes" | null>(
+    null,
+  );
+  const [activeKey, setActiveKey] = useState<string | null>(decisionKey);
+
+  // Reset the in-progress comment when the decision target changes, so text
+  // typed for one stage/issue can never be submitted against another. Adjusting
+  // state during render (React's documented "store info from previous renders"
+  // pattern) resets before paint — no stale, already-enabled textarea flashes.
+  if (decisionKey !== activeKey) {
+    setActiveKey(decisionKey);
+    setComment("");
+    setWorking(null);
+  }
 
   if (!decision) return null;
 
@@ -106,13 +129,17 @@ export function IssueExecutionDecisionCard({
       className="my-3 space-y-3 rounded-lg border-2 border-violet-500/70 bg-transparent p-4"
     >
       <div className="flex items-start gap-2.5">
-        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-violet-600 dark:text-violet-300" aria-hidden="true" />
+        <ShieldCheck
+          className="mt-0.5 h-4 w-4 shrink-0 text-violet-600 dark:text-violet-300"
+          aria-hidden="true"
+        />
         <div className="space-y-0.5">
           <p className="text-sm font-medium leading-tight text-foreground">
             {label} — your decision is needed
           </p>
           <p className="text-xs leading-snug text-muted-foreground">
-            Approve to advance this stage, or request changes to send it back to the assignee. A comment is required.
+            Approve to advance this stage, or request changes to send it back to
+            the assignee. A comment is required.
           </p>
         </div>
       </div>
