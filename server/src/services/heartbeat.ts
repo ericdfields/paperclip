@@ -14905,6 +14905,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // commit as queued runs inside this transaction; only the single-result
         // side effects are skipped, as with other non-returned promotions.
         await drainEligibleSiblingDeferredWakes(issue.id);
+
+        // Not draining the primary issue's own wakes above still leaves them
+        // sitting in `deferred_issue_execution`, and nothing else ever
+        // transitions that status — the recovery reconciler even reads it as
+        // an active execution path and stands down its own safety net. Fail
+        // them out explicitly, matching the same terminalization pattern used
+        // for ineligible wakes inside the drain loop above, so a wake parked
+        // on the very issue we're about to block doesn't strand forever.
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "failed",
+            finishedAt: new Date(),
+            error:
+              "Stranded by workspace/configuration validation failure — issue was parked blocked for recovery; comment again (or resolve the recovery action) once unblocked to get a fresh wake.",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            ),
+          );
+
         const configurationIncomplete = isConfigurationIncompleteFailedRun(run);
         return {
           kind: "blocked" as const,
