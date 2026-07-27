@@ -296,6 +296,58 @@ describe("IssueExecutionDecisionCard rendering", () => {
     flushSync(() => root.unmount());
   });
 
+  it("clears the comment on a request-changes round trip that reuses the same stage id", () => {
+    // A single-stage policy's "request changes" cycle sends the issue back to
+    // the assignee and later returns it to the SAME stage id — the reviewer's
+    // tree position and currentStageId are identical across rounds, so only
+    // lastDecisionId (freshly stamped by the request-changes decision itself)
+    // distinguishes "still round one" from "a new round after the fix landed".
+    const onApprove = vi.fn().mockResolvedValue(undefined);
+    const root = createRoot(container);
+
+    flushSync(() => {
+      root.render(
+        <IssueExecutionDecisionCard
+          issue={issueWith(stateWith({}), "issue-1")}
+          currentUserId={VIEWER}
+          onApprove={onApprove}
+          onRequestChanges={vi.fn()}
+        />,
+      );
+    });
+    typeComment("Round one: needs a rollback plan.");
+    expect(findButton("Approve")!.disabled).toBe(false);
+
+    // Round two: same issue, same currentStageId ("stage-1"), but the
+    // request-changes decision that sent it back stamped a fresh
+    // lastDecisionId. The card must not carry round one's comment over.
+    flushSync(() => {
+      root.render(
+        <IssueExecutionDecisionCard
+          issue={issueWith(
+            stateWith({ lastDecisionId: "decision-round-1" }),
+            "issue-1",
+          )}
+          currentUserId={VIEWER}
+          onApprove={onApprove}
+          onRequestChanges={vi.fn()}
+        />,
+      );
+    });
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea!.value).toBe("");
+    expect(findButton("Approve")!.disabled).toBe(true);
+    flushSync(() =>
+      findButton("Approve")!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      ),
+    );
+    expect(onApprove).not.toHaveBeenCalled();
+
+    flushSync(() => root.unmount());
+  });
+
   it("does not let a stale in-flight decision re-enable the buttons after a stage advance", async () => {
     // Both decisions' PATCHes stay pending until we resolve them by hand, so we
     // can observe the first resolving while the second is still in flight.

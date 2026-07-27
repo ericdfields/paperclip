@@ -79,11 +79,17 @@ export function IssueExecutionDecisionCard({
   const decision = getPendingExecutionDecision(issue, currentUserId);
 
   // Identity of the decision this card is currently editing. Changes when the
-  // viewer navigates to a different actionable issue OR realtime data advances
-  // this issue to another pending stage — both of which can reuse this same
-  // component instance without a remount (e.g. same tree position, no `key`).
+  // viewer navigates to a different actionable issue, realtime data advances
+  // this issue to another pending stage, OR a request-changes round trip
+  // returns the SAME issue to the SAME stage (a single-stage policy reuses its
+  // one stage's id every cycle, so stage id alone cannot distinguish "still the
+  // round I was already editing" from "a fresh round after the assignee's fix
+  // landed"). `lastDecisionId` is stamped with a new randomUUID() on every
+  // approve/request-changes decision (`server/src/routes/issues.ts`), including
+  // the request-changes decision that sends work back — so it reliably changes
+  // between rounds even when `currentStageId` does not.
   const decisionKey = decision
-    ? `${issue.id}::${issue.executionState?.currentStageId ?? ""}`
+    ? `${issue.id}::${issue.executionState?.currentStageId ?? ""}::${issue.executionState?.lastDecisionId ?? ""}`
     : null;
 
   const [comment, setComment] = useState("");
