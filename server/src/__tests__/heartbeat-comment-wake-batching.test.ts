@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { WebSocketServer } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -3149,6 +3149,151 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(recoveryComment).not.toBeUndefined();
       expect(recoveryComment?.body).toContain("Pending feedback that could not be delivered");
       expect(recoveryComment?.body).toContain(strandedFeedbackBody);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
+  it("points the recovery wake at the blocked-recovery comment instead of leaving the pending feedback undiscoverable", async () => {
+    // Greptile flagged that a workspace-validation recovery wake carries no
+    // pending-comment context, so a resumed agent could omit the stranded
+    // feedback entirely rather than merely needing to read the thread for
+    // it. The content itself was never lost (the previous test proves it's
+    // quoted verbatim into a real, permanent comment) -- but nothing pointed
+    // the resumed run at that comment. This asserts the recovery wake now
+    // carries a direct reference to it.
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const primaryIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+    const strandedFeedbackBody =
+      "Founder rejected this: the pricing copy on the landing page still says $99 instead of $79 — please fix before shipping.";
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-token" },
+          payloadTemplate: { message: "wake now" },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: primaryIssueId,
+        companyId,
+        title: "Primary issue with a real pending comment",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const primaryComment = await db
+        .insert(issueComments)
+        .values({ companyId, issueId: primaryIssueId, authorUserId: "user-1", body: "Start primary work" })
+        .returning()
+        .then((rows) => rows[0]);
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: primaryComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: primaryComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const strandedFeedbackComment = await db
+        .insert(issueComments)
+        .values({ companyId, issueId: primaryIssueId, authorUserId: "founder-user", body: strandedFeedbackBody })
+        .returning()
+        .then((rows) => rows[0]);
+      const strandedDeferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId: primaryIssueId, commentId: strandedFeedbackComment.id },
+        contextSnapshot: {
+          issueId: primaryIssueId,
+          taskId: primaryIssueId,
+          commentId: strandedFeedbackComment.id,
+          wakeCommentId: strandedFeedbackComment.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "founder-user",
+      });
+      expect(strandedDeferredRun).toBeNull();
+
+      await heartbeat.cancelRun(
+        firstRun!.id,
+        "workspace validation failed before dispatch",
+        { errorCode: "workspace_validation_failed" },
+      );
+
+      const primaryAfterRelease = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, primaryIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(primaryAfterRelease?.status).toBe("blocked");
+
+      const primaryComments = await db
+        .select({ id: issueComments.id, body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, primaryIssueId));
+      const recoveryComment = primaryComments.find((comment) =>
+        comment.body.includes("issue workspace failed validation"),
+      );
+      expect(recoveryComment).not.toBeUndefined();
+      expect(recoveryComment?.body).toContain(strandedFeedbackBody);
+
+      const recoveryWake = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${primaryIssueId}`,
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(recoveryWake).not.toBeNull();
+      // agent_wakeup_requests only persists `payload`, not `contextSnapshot`
+      // (that gets folded into the run's own contextSnapshot once claimed) --
+      // payload.commentId is the same field deriveCommentId() falls back to,
+      // and is what confirms the reference actually reached the queued wake.
+      expect(recoveryWake?.payload).toMatchObject({ commentId: recoveryComment!.id });
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
