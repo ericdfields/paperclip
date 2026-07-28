@@ -107,6 +107,7 @@ import {
   IssueMonitorComposerStrip,
   hasVisibleMonitorSurface,
 } from "../components/IssueMonitorBanner";
+import { IssueExecutionDecisionCard } from "../components/IssueExecutionDecisionCard";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { IssueProperties } from "../components/IssueProperties";
 import { PauseAffectsSummaryView } from "../components/interrupt-handoff/InterruptHandoffViews";
@@ -4486,6 +4487,13 @@ export function IssueDetail() {
           issue={issue}
           onCheckNow={() => checkIssueMonitorNow.mutate()}
           checkingNow={checkIssueMonitorNow.isPending}
+        />
+
+        <IssueExecutionDecisionCard
+          issue={issue}
+          currentUserId={currentUserId}
+          onApprove={(comment) => updateIssue.mutateAsync({ status: "done", comment })}
+          onRequestChanges={(comment) => updateIssue.mutateAsync({ status: "in_progress", comment })}
         />
 
         <InlineEditor
