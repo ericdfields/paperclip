@@ -38,7 +38,7 @@ function StoryFrame({ title, children }: { title: string; children: React.ReactN
   );
 }
 
-/** Interactive so screenshots can show the disabled-until-typed state honestly. */
+/** Interactive so screenshots can show Request-changes' disabled-until-typed state honestly. */
 function InteractiveCard(props: { issue: Issue; working?: boolean }) {
   return (
     <IssueExecutionDecisionCard

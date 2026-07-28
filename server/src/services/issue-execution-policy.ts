@@ -697,9 +697,6 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (principalsEqual(currentParticipant, actor)) {
       if (requestedStatus === "done") {
-        if (!input.commentBody?.trim()) {
-          throw unprocessable("Approving a review or approval stage requires a comment");
-        }
         const approvedState = buildCompletedState(existingState, activeStage);
         const nextStage = nextPendingStage(
           input.policy,
@@ -714,7 +711,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               stageId: activeStage.id,
               stageType: activeStage.type,
               outcome: "approved",
-              body: input.commentBody.trim(),
+              body: input.commentBody?.trim() ?? "",
             },
           };
         }
@@ -742,7 +739,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             stageId: activeStage.id,
             stageType: activeStage.type,
             outcome: "approved",
-            body: input.commentBody.trim(),
+            body: input.commentBody?.trim() ?? "",
           },
           workflowControlledAssignment: true,
         };

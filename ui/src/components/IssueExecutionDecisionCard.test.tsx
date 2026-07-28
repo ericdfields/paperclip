@@ -160,7 +160,7 @@ describe("IssueExecutionDecisionCard rendering", () => {
     flushSync(() => root.unmount());
   });
 
-  it("gates both actions behind a required comment, then approves with the trimmed comment", () => {
+  it("approve works without a comment; request changes stays gated on one", () => {
     const onApprove = vi.fn().mockResolvedValue(undefined);
     const onRequestChanges = vi.fn().mockResolvedValue(undefined);
     const root = createRoot(container);
@@ -180,17 +180,37 @@ describe("IssueExecutionDecisionCard rendering", () => {
     ).toBeTruthy();
     expect(container.textContent).toContain("Review — your decision is needed");
 
-    // Empty comment → both actions disabled, clicking Approve is a no-op.
+    // Empty comment → Approve is enabled (comment optional), Request changes is not.
     const approve = findButton("Approve");
     expect(approve).toBeTruthy();
-    expect(approve!.disabled).toBe(true);
+    expect(approve!.disabled).toBe(false);
+    expect(findButton("Request changes")!.disabled).toBe(true);
+
     flushSync(() =>
       approve!.dispatchEvent(new MouseEvent("click", { bubbles: true })),
     );
-    expect(onApprove).not.toHaveBeenCalled();
+    expect(onApprove).toHaveBeenCalledTimes(1);
+    expect(onApprove).toHaveBeenCalledWith("");
+    expect(onRequestChanges).not.toHaveBeenCalled();
+
+    flushSync(() => root.unmount());
+  });
+
+  it("approves with the trimmed comment when one is provided", () => {
+    const onApprove = vi.fn().mockResolvedValue(undefined);
+    const root = createRoot(container);
+    flushSync(() => {
+      root.render(
+        <IssueExecutionDecisionCard
+          issue={issueWith(stateWith({}))}
+          currentUserId={VIEWER}
+          onApprove={onApprove}
+          onRequestChanges={vi.fn()}
+        />,
+      );
+    });
 
     typeComment("  Looks correct, approving.  ");
-    expect(findButton("Approve")!.disabled).toBe(false);
     flushSync(() =>
       findButton("Approve")!.dispatchEvent(
         new MouseEvent("click", { bubbles: true }),
@@ -198,7 +218,6 @@ describe("IssueExecutionDecisionCard rendering", () => {
     );
     expect(onApprove).toHaveBeenCalledTimes(1);
     expect(onApprove).toHaveBeenCalledWith("Looks correct, approving.");
-    expect(onRequestChanges).not.toHaveBeenCalled();
 
     flushSync(() => root.unmount());
   });
@@ -227,9 +246,12 @@ describe("IssueExecutionDecisionCard rendering", () => {
     );
     expect(container.textContent).toContain("Confirm the migration ran");
 
+    // Request changes stays disabled until a comment is entered.
+    expect(findButton("Request changes")!.disabled).toBe(true);
+
     typeComment("Needs a rollback plan first.");
     const requestChanges = findButton("Request changes");
-    expect(requestChanges).toBeTruthy();
+    expect(requestChanges!.disabled).toBe(false);
     flushSync(() =>
       requestChanges!.dispatchEvent(new MouseEvent("click", { bubbles: true })),
     );
@@ -242,6 +264,7 @@ describe("IssueExecutionDecisionCard rendering", () => {
 
   it("clears the comment when the decision target changes without a remount", () => {
     const onApprove = vi.fn().mockResolvedValue(undefined);
+    const onRequestChanges = vi.fn().mockResolvedValue(undefined);
     const root = createRoot(container);
 
     // Reviewer starts a decision on issue-1 / stage-1 and types a comment.
@@ -251,16 +274,16 @@ describe("IssueExecutionDecisionCard rendering", () => {
           issue={issueWith(stateWith({}), "issue-1")}
           currentUserId={VIEWER}
           onApprove={onApprove}
-          onRequestChanges={vi.fn()}
+          onRequestChanges={onRequestChanges}
         />,
       );
     });
     typeComment("Comment intended only for issue one.");
-    expect(findButton("Approve")!.disabled).toBe(false);
+    expect(findButton("Request changes")!.disabled).toBe(false);
 
     // Same tree position reused for a different issue + pending stage (SPA nav
-    // or realtime advance). The card must NOT carry the prior comment over, and
-    // both actions must fall back to disabled until a fresh comment is entered.
+    // or realtime advance). The card must NOT carry the prior comment over —
+    // Request changes (still comment-gated) must fall back to disabled.
     flushSync(() => {
       root.render(
         <IssueExecutionDecisionCard
@@ -273,7 +296,7 @@ describe("IssueExecutionDecisionCard rendering", () => {
           )}
           currentUserId={VIEWER}
           onApprove={onApprove}
-          onRequestChanges={vi.fn()}
+          onRequestChanges={onRequestChanges}
         />,
       );
     });
@@ -285,13 +308,23 @@ describe("IssueExecutionDecisionCard rendering", () => {
       "Approval — your decision is needed",
     );
 
-    // Clicking Approve now is a no-op — no stale comment can be submitted.
+    // Clicking Request changes now is a no-op — no stale comment can be submitted.
+    expect(findButton("Request changes")!.disabled).toBe(true);
+    flushSync(() =>
+      findButton("Request changes")!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      ),
+    );
+    expect(onRequestChanges).not.toHaveBeenCalled();
+
+    // Approve is unaffected (comment optional) but must submit "" — not the
+    // stale issue-one comment — confirming the reset actually cleared state.
     flushSync(() =>
       findButton("Approve")!.dispatchEvent(
         new MouseEvent("click", { bubbles: true }),
       ),
     );
-    expect(onApprove).not.toHaveBeenCalled();
+    expect(onApprove).toHaveBeenCalledWith("");
 
     flushSync(() => root.unmount());
   });
@@ -302,7 +335,7 @@ describe("IssueExecutionDecisionCard rendering", () => {
     // tree position and currentStageId are identical across rounds, so only
     // lastDecisionId (freshly stamped by the request-changes decision itself)
     // distinguishes "still round one" from "a new round after the fix landed".
-    const onApprove = vi.fn().mockResolvedValue(undefined);
+    const onRequestChanges = vi.fn().mockResolvedValue(undefined);
     const root = createRoot(container);
 
     flushSync(() => {
@@ -310,13 +343,13 @@ describe("IssueExecutionDecisionCard rendering", () => {
         <IssueExecutionDecisionCard
           issue={issueWith(stateWith({}), "issue-1")}
           currentUserId={VIEWER}
-          onApprove={onApprove}
-          onRequestChanges={vi.fn()}
+          onApprove={vi.fn()}
+          onRequestChanges={onRequestChanges}
         />,
       );
     });
     typeComment("Round one: needs a rollback plan.");
-    expect(findButton("Approve")!.disabled).toBe(false);
+    expect(findButton("Request changes")!.disabled).toBe(false);
 
     // Round two: same issue, same currentStageId ("stage-1"), but the
     // request-changes decision that sent it back stamped a fresh
@@ -329,21 +362,21 @@ describe("IssueExecutionDecisionCard rendering", () => {
             "issue-1",
           )}
           currentUserId={VIEWER}
-          onApprove={onApprove}
-          onRequestChanges={vi.fn()}
+          onApprove={vi.fn()}
+          onRequestChanges={onRequestChanges}
         />,
       );
     });
 
     const textarea = container.querySelector("textarea");
     expect(textarea!.value).toBe("");
-    expect(findButton("Approve")!.disabled).toBe(true);
+    expect(findButton("Request changes")!.disabled).toBe(true);
     flushSync(() =>
-      findButton("Approve")!.dispatchEvent(
+      findButton("Request changes")!.dispatchEvent(
         new MouseEvent("click", { bubbles: true }),
       ),
     );
-    expect(onApprove).not.toHaveBeenCalled();
+    expect(onRequestChanges).not.toHaveBeenCalled();
 
     flushSync(() => root.unmount());
   });

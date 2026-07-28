@@ -604,33 +604,33 @@ describe("issue execution policy transitions", () => {
     const policy = twoStagePolicy();
     const reviewStageId = policy.stages[0].id;
 
-    it("approval without comment throws", () => {
-      expect(() =>
-        applyIssueExecutionPolicyTransition({
-          issue: {
-            status: "in_review",
-            assigneeAgentId: qaAgentId,
-            assigneeUserId: null,
-            executionPolicy: policy,
-            executionState: {
-              status: "pending",
-              currentStageId: reviewStageId,
-              currentStageIndex: 0,
-              currentStageType: "review",
-              currentParticipant: { type: "agent", agentId: qaAgentId },
-              returnAssignee: { type: "agent", agentId: coderAgentId },
-              completedStageIds: [],
-              lastDecisionId: null,
-              lastDecisionOutcome: null,
-            },
+    it("approval without comment succeeds (comment is optional on approve)", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
           },
-          policy,
-          requestedStatus: "done",
-          requestedAssigneePatch: {},
-          actor: { agentId: qaAgentId },
-          commentBody: "",
-        }),
-      ).toThrow("requires a comment");
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "",
+      });
+
+      expect(result.decision).toMatchObject({ outcome: "approved", body: "" });
     });
 
     it("changes requested without comment throws", () => {
@@ -662,7 +662,7 @@ describe("issue execution policy transitions", () => {
       ).toThrow("requires a comment");
     });
 
-    it("whitespace-only comment is treated as empty", () => {
+    it("whitespace-only comment is treated as empty (still throws on request-changes)", () => {
       expect(() =>
         applyIssueExecutionPolicyTransition({
           issue: {
@@ -683,12 +683,41 @@ describe("issue execution policy transitions", () => {
             },
           },
           policy,
-          requestedStatus: "done",
+          requestedStatus: "in_progress",
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
           commentBody: "   ",
         }),
       ).toThrow("requires a comment");
+    });
+
+    it("whitespace-only comment on approve is trimmed to empty, not thrown", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "   ",
+      });
+
+      expect(result.decision).toMatchObject({ outcome: "approved", body: "" });
     });
   });
 

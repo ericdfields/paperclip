@@ -52,9 +52,9 @@ function stageLabel(stageType: IssueExecutionStageType): string {
 export interface IssueExecutionDecisionCardProps {
   issue: Issue;
   currentUserId: string | null;
-  /** Approve the stage. The backend requires a non-empty comment. */
+  /** Approve the stage. Comment is optional. */
   onApprove: (comment: string) => Promise<unknown> | void;
-  /** Send the issue back to its return assignee with requested changes. */
+  /** Send the issue back to its return assignee with requested changes. The backend requires a non-empty comment. */
   onRequestChanges: (comment: string) => Promise<unknown> | void;
 }
 
@@ -63,12 +63,11 @@ export interface IssueExecutionDecisionCardProps {
  * Rendered between the issue title and description (alongside the monitor
  * banner) when `getPendingExecutionDecision` matches the viewer.
  *
- * Mirrors the `request_confirmation` card's comment-required, two-action pattern
- * so a human on a stage can Approve (`PATCH { status: "done", comment }`) or
+ * Lets a human on a stage Approve (`PATCH { status: "done", comment }`) or
  * Request changes (`PATCH { status: "in_progress", comment }`) without
- * hand-rolling an API call. The comment is required to match backend validation
- * (`applyIssueExecutionStageTransition` throws 422 on an empty decision
- * comment), so both actions stay disabled until a comment is entered.
+ * hand-rolling an API call. Only Request changes requires a comment, matching
+ * backend validation (`applyIssueExecutionStageTransition` throws 422 on an
+ * empty request-changes comment, but allows an empty approve comment).
  */
 export function IssueExecutionDecisionCard({
   issue,
@@ -119,13 +118,15 @@ export function IssueExecutionDecisionCard({
 
   const label = stageLabel(decision.stageType);
   const trimmed = comment.trim();
-  const canSubmit = trimmed.length > 0 && working === null;
+  const canApprove = working === null;
+  const canRequestChanges = trimmed.length > 0 && working === null;
 
   async function run(
     action: "approve" | "request_changes",
     handler: (comment: string) => Promise<unknown> | void,
+    allowed: boolean,
   ) {
-    if (!canSubmit) return;
+    if (!allowed) return;
     // Capture the decision this run belongs to. If the issue advances to another
     // pending stage while this PATCH is in flight, the render-time reset already
     // clears `working` for the new stage; without this guard the stale run's
@@ -158,7 +159,8 @@ export function IssueExecutionDecisionCard({
           </p>
           <p className="text-xs leading-snug text-muted-foreground">
             Approve to advance this stage, or request changes to send it back to
-            the assignee. A comment is required.
+            the assignee. A comment is optional for approval, required for
+            requesting changes.
           </p>
         </div>
       </div>
@@ -176,7 +178,7 @@ export function IssueExecutionDecisionCard({
         aria-label={`${label} decision comment`}
         value={comment}
         onChange={(event) => setComment(event.target.value)}
-        placeholder="Add a comment explaining your decision (required)"
+        placeholder="Add a comment (optional for approval, required to request changes)"
         className="min-h-24 bg-background text-sm"
         disabled={working !== null}
       />
@@ -184,8 +186,8 @@ export function IssueExecutionDecisionCard({
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Button
           size="sm"
-          disabled={!canSubmit}
-          onClick={() => void run("approve", onApprove)}
+          disabled={!canApprove}
+          onClick={() => void run("approve", onApprove, canApprove)}
         >
           {working === "approve" ? (
             <>
@@ -199,8 +201,8 @@ export function IssueExecutionDecisionCard({
         <Button
           size="sm"
           variant="outline"
-          disabled={!canSubmit}
-          onClick={() => void run("request_changes", onRequestChanges)}
+          disabled={!canRequestChanges}
+          onClick={() => void run("request_changes", onRequestChanges, canRequestChanges)}
         >
           {working === "request_changes" ? (
             <>
