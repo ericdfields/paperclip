@@ -1333,7 +1333,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     openRouterFallbackActive = true;
     const retryAttempt = await runAttempt(resumeSessionId);
     const retryResult = toAdapterResult(retryAttempt, opts);
-    await notifyOpenRouterFallback();
+    // Only claim completion + persist the flag when the OpenRouter retry
+    // actually succeeded. If it also failed (e.g. OpenRouter is down or the
+    // Claude model id is not accepted by OpenRouter), returning the failed
+    // result is correct — but persisting openrouterFallbackActive would lock
+    // later heartbeats onto a provider that just failed, and the "no Founder
+    // action needed" alert would be untrue.
+    const retrySucceeded =
+      (retryResult.exitCode ?? 1) === 0 && !retryResult.timedOut && !retryResult.errorCode;
+    if (retrySucceeded) {
+      await notifyOpenRouterFallback();
+    } else {
+      await onLog(
+        "stderr",
+        "[paperclip] OpenRouter fallback retry did not succeed; leaving openrouterFallbackActive unset and not posting a completion alert.\n",
+      );
+    }
     return retryResult;
   };
 

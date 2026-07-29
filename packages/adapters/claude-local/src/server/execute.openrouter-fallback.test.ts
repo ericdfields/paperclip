@@ -202,6 +202,22 @@ describe("claude_local OpenRouter 529 fallback", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("does not persist the flag or claim completion when the OpenRouter retry also fails", async () => {
+    // 529 on Anthropic, then the OpenRouter retry itself fails (e.g. bad model id).
+    procQueue.push(overloadedProcess(), overloadedProcess());
+    const ctx = buildContext({ openrouterApiKey: "or-test-key" }, { taskId: "issue-xyz" });
+
+    const result = await execute(ctx as never);
+
+    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
+    // The retry was attempted on OpenRouter...
+    expect(envSnapshots[1].baseUrl).toBe(OPENROUTER_BASE_URL);
+    // ...but it failed, so we return the failed result and do NOT alert/persist.
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(loggedWith(ctx, "did not succeed")).toBe(true);
+  });
+
   it("does not loop when a 529 recurs while already on OpenRouter", async () => {
     procQueue.push(overloadedProcess());
     const ctx = buildContext(
