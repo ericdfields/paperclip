@@ -213,6 +213,32 @@ describe("createTestHarness host call interception is transparent by default", (
     unsubscribe();
   });
 
+  it("keeps synchronous ctx methods synchronous even when an interceptor is configured", async () => {
+    const seen: string[] = [];
+    const harness = createTestHarness({
+      manifest: { ...plainManifest, capabilities: ["events.subscribe", "issues.read"] },
+      hostCallInterceptor: async (call, proceed) => {
+        seen.push(call.path);
+        return proceed();
+      },
+    });
+
+    // `ctx.events.on` returns an unsubscribe callback synchronously. Plugin
+    // cleanup code calls it directly, so it must never become a Promise.
+    const unsubscribe = harness.ctx.events.on("issue.created", async () => {});
+    expect(typeof unsubscribe).toBe("function");
+    expect(unsubscribe).not.toBeInstanceOf(Promise);
+    expect(() => unsubscribe()).not.toThrow();
+
+    // Asynchronous host calls are still intercepted.
+    await harness.ctx.issues.get("missing", "company-1");
+    expect(seen).toContain("issues.get");
+
+    // The synchronous call is recorded, it is just not routed through the interceptor.
+    expect(harness.hostCalls.map((call) => call.path)).toContain("events.on");
+    expect(seen).not.toContain("events.on");
+  });
+
   it("returns reference-stable namespaces and methods so spies and toBe assertions work", () => {
     const harness = createTestHarness({ manifest: plainManifest });
 

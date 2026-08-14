@@ -125,8 +125,14 @@ export interface TestHarnessOptions {
    */
   eventDispatch?: TestHarnessEventDispatch;
   /**
-   * Intercept every host call made through `ctx` (any `ctx.<namespace>.<method>(...)`).
-   * Runs outermost around the queued-fault layer registered via `harness.faults`.
+   * Intercept the asynchronous host calls made through `ctx` (any
+   * `ctx.<namespace>.<method>(...)` declared `async`). Runs outermost around
+   * the queued-fault layer registered via `harness.faults`.
+   *
+   * The synchronous parts of `ctx` are not intercepted, because interception
+   * is promise-based and those callers rely on a synchronous return value.
+   * `ctx.events.on`, for example, returns an unsubscribe callback directly.
+   * Such calls are still recorded in `harness.hostCalls`.
    */
   hostCallInterceptor?: TestHarnessHostCallInterceptor;
 }
@@ -544,6 +550,12 @@ function isInCompany<T extends { companyId: string | null | undefined }>(
 ): record is T {
   return Boolean(record && record.companyId === companyId);
 }
+
+/**
+ * Constructor of `async function`, used to tell the asynchronous host calls on
+ * `ctx` apart from its synchronous registration APIs. See `interceptCall`.
+ */
+const ASYNC_FUNCTION_CTOR = Object.getPrototypeOf(async () => {}).constructor as FunctionConstructor;
 
 /**
  * Create an in-memory host harness for plugin worker tests.
@@ -2646,21 +2658,26 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
 
   /**
    * Wrap one host method. Every call is logged to `hostCalls` regardless of
-   * whether anything is intercepting it. The wrapper only becomes async (a
-   * `Promise`-returning function) when a fault or `hostCallInterceptor` is
-   * actually in play for this specific call — otherwise it forwards the real
-   * return value untouched. That keeps synchronous host methods (e.g.
-   * `ctx.events.on`, which returns an unsubscribe function synchronously)
-   * working exactly as before for the common case where no test in the suite
-   * uses fault injection.
+   * whether anything is intercepting it.
+   *
+   * Only `async` methods are ever routed through the fault/interceptor
+   * pipeline, because that pipeline is inherently promise-returning. The
+   * synchronous parts of `ctx` are registration and observation APIs —
+   * `ctx.events.on`, the `register` methods, `ctx.streams.open/emit/close`,
+   * `ctx.logger.*` — not host round trips, and callers depend on their
+   * synchronous return values. `ctx.events.on` in particular returns an
+   * unsubscribe callback that plugin cleanup code invokes directly, so
+   * turning it into a `Promise` would break real plugins. Those methods are
+   * still recorded in `hostCalls`; they are simply never faulted.
    */
   function interceptCall(fn: (...args: unknown[]) => unknown, thisArg: unknown, path: string) {
+    const isAsyncHostCall = fn instanceof ASYNC_FUNCTION_CTOR;
     return (...args: unknown[]) => {
       const call: TestHarnessHostCall = { path, args, seq: hostCallSeq++ };
       hostCalls.push(call);
 
-      const fault = takeMatchingFault(path, args);
-      const userInterceptor = options.hostCallInterceptor;
+      const fault = isAsyncHostCall ? takeMatchingFault(path, args) : undefined;
+      const userInterceptor = isAsyncHostCall ? options.hostCallInterceptor : undefined;
       if (!fault && !userInterceptor) {
         return fn.apply(thisArg, args);
       }
