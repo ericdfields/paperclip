@@ -249,6 +249,34 @@ describe("seedSanitizedCodexConfigToml", () => {
     });
   });
 
+  it("refuses to touch the host home reached through a symlink", async () => {
+    // $CODEX_HOME / ~/.codex can be a symlink, so a resolved-string compare
+    // would miss the collision and write over the user's own config.
+    await withHomes(async ({ sourceHome, targetHome }) => {
+      const hostConfig = path.join(sourceHome, "config.toml");
+      await fs.writeFile(hostConfig, HOST_CONFIG, "utf8");
+      await fs.symlink(sourceHome, targetHome);
+
+      const result = await seedSanitizedCodexConfigToml({ sourceHome, targetHome });
+
+      expect(result.wrote).toBe(false);
+      expect(await fs.readFile(hostConfig, "utf8")).toBe(HOST_CONFIG);
+    });
+  });
+
+  it("leaves a non-regular file at the managed config path alone", async () => {
+    await withHomes(async ({ sourceHome, targetHome }) => {
+      await fs.writeFile(path.join(sourceHome, "config.toml"), HOST_CONFIG, "utf8");
+      // Not Paperclip-written state: do not read through it, do not write over it.
+      await fs.mkdir(path.join(targetHome, "config.toml"), { recursive: true });
+
+      const result = await seedSanitizedCodexConfigToml({ sourceHome, targetHome });
+
+      expect(result.wrote).toBe(false);
+      expect((await fs.lstat(path.join(targetHome, "config.toml"))).isDirectory()).toBe(true);
+    });
+  });
+
   it("refuses to touch the host home when source and target are the same", async () => {
     await withHomes(async ({ sourceHome }) => {
       const hostConfig = path.join(sourceHome, "config.toml");

@@ -130,6 +130,23 @@ export interface CodexSeedSanitizationReport {
 
 const CODEX_CONFIG_FILE = "config.toml";
 
+/**
+ * True when both paths name the same directory. Compares real paths, not just
+ * resolved strings: the host home reaches us as `$CODEX_HOME` or `~/.codex`,
+ * either of which can be a symlink, and a plain string compare would then miss
+ * the collision and let a "managed" seed write over the user's own config. Falls
+ * back to the resolved strings when a path does not exist yet — the managed home
+ * usually does not, and in that case it cannot be the host home either.
+ */
+async function isSameDirectory(left: string, right: string): Promise<boolean> {
+  const [realLeft, realRight] = await Promise.all(
+    [left, right].map((candidate) =>
+      fs.realpath(candidate).catch(() => path.resolve(candidate)),
+    ),
+  );
+  return realLeft === realRight;
+}
+
 async function readFileOrNull(target: string): Promise<string | null> {
   return fs.readFile(target, "utf8").catch((error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -170,14 +187,21 @@ export async function seedSanitizedCodexConfigToml(
   input: SeedSanitizedCodexConfigTomlInput,
 ): Promise<SeedSanitizedCodexConfigTomlResult> {
   const empty = { removedKeys: [], hasIndirectSelection: false, wrote: false };
-  if (path.resolve(input.sourceHome) === path.resolve(input.targetHome)) return empty;
+  if (await isSameDirectory(input.sourceHome, input.targetHome)) return empty;
 
   const target = path.join(input.targetHome, CODEX_CONFIG_FILE);
-  const alreadySeeded = (await fs.lstat(target).catch(() => null)) !== null;
-  const existing = alreadySeeded
+  // A managed config.toml is always a regular file. Anything else at that path
+  // (a directory, a symlink the user pointed somewhere) is not Paperclip-written
+  // state, so leave it alone rather than reading through it or writing over it —
+  // the same policy `ensureSymlink` applies to a directory in a managed home.
+  const seeded = await fs.lstat(target).catch(() => null);
+  if (seeded && !seeded.isFile()) return empty;
+
+  const existing = seeded
     ? await readFileOrNull(target)
     : await readFileOrNull(path.join(input.sourceHome, CODEX_CONFIG_FILE));
   if (existing === null) return empty;
+  const alreadySeeded = seeded !== null;
 
   const { content, removedKeys, hasIndirectSelection } =
     stripInheritedCodexModelSelection(existing);
