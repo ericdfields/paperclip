@@ -231,6 +231,24 @@ describe("seedSanitizedCodexConfigToml", () => {
     });
   });
 
+  it("tightens the mode of an existing managed config it repairs", async () => {
+    // writeFile's `mode` only applies on creation. A home seeded by the older
+    // copy-the-host-file behaviour inherited the host's mode, so the repair
+    // path can find a 0644 config — holding the managed MCP bearer header.
+    await withHomes(async ({ sourceHome, targetHome }) => {
+      await fs.writeFile(path.join(sourceHome, "config.toml"), HOST_CONFIG, "utf8");
+      const managed = path.join(targetHome, "config.toml");
+      await fs.mkdir(targetHome, { recursive: true });
+      await fs.writeFile(managed, HOST_CONFIG, { encoding: "utf8", mode: 0o644 });
+      await fs.chmod(managed, 0o644);
+
+      const result = await seedSanitizedCodexConfigToml({ sourceHome, targetHome });
+
+      expect(result.wrote).toBe(true);
+      expect((await fs.stat(managed)).mode & 0o777).toBe(0o600);
+    });
+  });
+
   it("refuses to touch the host home when source and target are the same", async () => {
     await withHomes(async ({ sourceHome }) => {
       const hostConfig = path.join(sourceHome, "config.toml");

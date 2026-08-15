@@ -187,6 +187,13 @@ export async function seedSanitizedCodexConfigToml(
 
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, content, { mode: 0o600 });
+  // `mode` above only applies when writeFile creates the file. On the repair
+  // path the managed config already exists — and a home seeded by the previous
+  // copy-the-host-file behaviour inherited the host's mode, so it can well be
+  // 0644. config.toml carries the managed MCP `Authorization: Bearer …` header,
+  // so chmod explicitly rather than leaving those credentials world-readable.
+  // This also pins the mode regardless of the process umask.
+  await fs.chmod(target, 0o600);
   const note = describeCodexSeedSanitization({ removedKeys, hasIndirectSelection }, input);
   if (note && input.onNote) await input.onNote(note);
   return { removedKeys, hasIndirectSelection, wrote: true };
