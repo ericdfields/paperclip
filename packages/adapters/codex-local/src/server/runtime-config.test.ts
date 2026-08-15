@@ -429,8 +429,10 @@ describe("prepareCodexRuntimeConfig", () => {
 // turns that into an actionable adapter error.
 describe("selected model_provider env_key readiness", () => {
   // Deliberately not OPENAI_API_KEY: a var that can be set in a developer's
-  // shell would make these tests pass or fail depending on the machine.
-  const GATEWAY_KEY = "PAPERCLIP_TEST_GATEWAY_KEY";
+  // shell would make these tests pass or fail depending on the machine. Also
+  // deliberately not PAPERCLIP_*-prefixed -- that prefix is stripped from the
+  // inherited env before codex is spawned, which is its own case below.
+  const GATEWAY_KEY = "CODEX_TEST_GATEWAY_KEY";
   const GATEWAY_PROVIDERS = {
     providers: {
       gw: { base_url: "http://gw.example/v1", env_key: GATEWAY_KEY, wire_api: "responses" },
@@ -568,6 +570,64 @@ describe("selected model_provider env_key readiness", () => {
     // The merge still happens; only the hard failure is withheld.
     expect(await readConfigToml(home)).toContain("[model_providers.gw]");
     await prepared.cleanup();
+  });
+
+  it("still warns for a remote target when only the control plane's process env has the key", async () => {
+    // The regression this whole distinction exists for. The control plane's
+    // environment does not cross the ssh/sandbox transport -- only the explicit
+    // env record does -- so crediting process.env here would silently pass a run
+    // that dies inside codex on the remote host. Reading it as "already set"
+    // withholds the one warning that would have explained the failure.
+    vi.stubEnv(GATEWAY_KEY, "sk-control-plane-only");
+    const home = await makeCodexHome();
+    const prepared = await prepareCodexRuntimeConfig({
+      env: { PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(GATEWAY_PROVIDERS) },
+      codexHome: home,
+      executionTargetIsRemote: true,
+    });
+
+    const warning = prepared.notes.find((n) => n.startsWith("Warning:"));
+    expect(warning).toContain(GATEWAY_KEY);
+    expect(warning).toContain("does not cross the transport");
+    await prepared.cleanup();
+  });
+
+  it("does not warn for a remote target when the adapter config env carries the key", async () => {
+    // The adapter config env IS forwarded across the transport, so it is the one
+    // source that settles the question for a remote run.
+    const home = await makeCodexHome();
+    const prepared = await prepareCodexRuntimeConfig({
+      env: {
+        PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(GATEWAY_PROVIDERS),
+        [GATEWAY_KEY]: "sk-gateway",
+      },
+      codexHome: home,
+      executionTargetIsRemote: true,
+    });
+
+    expect(prepared.notes.some((n) => n.startsWith("Warning:"))).toBe(false);
+    await prepared.cleanup();
+  });
+
+  it("fails fast when a PAPERCLIP_-prefixed env_key is satisfied only by the host process env", async () => {
+    // sanitizeInheritedPaperclipEnv strips PAPERCLIP_* from the inherited env
+    // before codex is spawned, so a value visible here never reaches the child.
+    // Treating it as set would pass the check on a run guaranteed to fail.
+    const prefixedKey = "PAPERCLIP_TEST_GATEWAY_KEY";
+    vi.stubEnv(prefixedKey, "sk-stripped-before-spawn");
+    const home = await makeCodexHome();
+
+    await expect(
+      prepareCodexRuntimeConfig({
+        env: {
+          PAPERCLIP_CODEX_PROVIDERS: JSON.stringify({
+            providers: { gw: { base_url: "http://gw.example/v1", env_key: prefixedKey } },
+            model_provider: "gw",
+          }),
+        },
+        codexHome: home,
+      }),
+    ).rejects.toThrow(prefixedKey);
   });
 
   it("warns but never fails or rewrites an explicitly configured CODEX_HOME", async () => {

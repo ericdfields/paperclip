@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
 type PreparedCodexRuntimeConfig = {
   notes: string[];
@@ -442,7 +443,30 @@ export async function prepareCodexRuntimeConfig(input: {
    */
   executionTargetIsRemote?: boolean;
 }): Promise<PreparedCodexRuntimeConfig> {
+  // Two different questions, two resolvers -- conflating them is what makes the
+  // pre-flight check lie.
+  //
+  // `resolveEnv` answers "what should this {env:VAR} placeholder expand to?".
+  // The expansion is baked into config.toml here on the control plane and
+  // travels with the file, so the control plane's own process.env is a
+  // legitimate source even for a run that executes elsewhere.
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  // `resolveRunEnv` answers the narrower question the env_key check needs:
+  // "will the codex process itself see a value for this variable?". The spawned
+  // child's environment is `sanitizeInheritedPaperclipEnv(process.env)` with the
+  // adapter config env layered on top (runChildProcess in adapter-utils) -- note
+  // the sanitize step, which drops PAPERCLIP_*, so a provider whose env_key uses
+  // that prefix is NOT satisfied by the host process env.
+  //
+  // A remote target inherits none of it: only the explicit env record crosses
+  // the transport (sanitizeRemoteExecutionEnv + buildSshSpawnTarget), so the
+  // control plane's process.env is not evidence of anything. Its own login
+  // profile may still supply the value and we cannot read it from here, which is
+  // why a miss on a remote target warns rather than fails.
+  const inheritedEnv: NodeJS.ProcessEnv = input.executionTargetIsRemote
+    ? {}
+    : sanitizeInheritedPaperclipEnv(process.env);
+  const resolveRunEnv = (name: string): string | undefined => input.env[name] ?? inheritedEnv[name];
   const notes: string[] = [];
   const parsed = parseCodexProvidersConfig(
     input.env.PAPERCLIP_CODEX_PROVIDERS ?? process.env.PAPERCLIP_CODEX_PROVIDERS,
@@ -458,7 +482,7 @@ export async function prepareCodexRuntimeConfig(input: {
     const externalConfigTomlPath = path.join(input.externalCodexHome, "config.toml");
     const externalConfig = await readFileOrNull(externalConfigTomlPath);
     const unset =
-      externalConfig === null ? null : findUnsetProviderEnvKey(externalConfig, resolveEnv);
+      externalConfig === null ? null : findUnsetProviderEnvKey(externalConfig, resolveRunEnv);
     if (unset) {
       notes.push(
         `Warning: ${describeUnsetProviderEnvKey(unset, externalConfigTomlPath)} ` +
@@ -536,13 +560,15 @@ export async function prepareCodexRuntimeConfig(input: {
   // selected provider names an unset env_key is guaranteed to die inside codex;
   // fail here, where the error can name the provider, the env var, and the file.
   // Nothing has been written yet, so a throw leaves the home exactly as it was.
-  const unsetEnvKey = findUnsetProviderEnvKey(merged, resolveEnv);
+  const unsetEnvKey = findUnsetProviderEnvKey(merged, resolveRunEnv);
   if (unsetEnvKey) {
     if (input.executionTargetIsRemote) {
       notes.push(
         `Warning: ${describeUnsetProviderEnvKey(unsetEnvKey, configTomlPath)} ` +
-          `This run targets a remote execution host whose environment Paperclip cannot read, ` +
-          `so this is a warning rather than a hard failure.`,
+          `This run targets a remote execution host: the control plane's own environment does ` +
+          `not cross the transport, so ${unsetEnvKey.envKey} has to come from the adapter config ` +
+          `env or from the remote host's own login profile -- which Paperclip cannot read from ` +
+          `here, so this is a warning rather than a hard failure.`,
       );
     } else {
       throw new Error(describeUnsetProviderEnvKey(unsetEnvKey, configTomlPath));
