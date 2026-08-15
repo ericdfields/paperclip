@@ -570,7 +570,7 @@ describe("selected model_provider env_key readiness", () => {
     await prepared.cleanup();
   });
 
-  it("warns but never fails or rewrites a user-managed CODEX_HOME", async () => {
+  it("warns but never fails or rewrites an explicitly configured CODEX_HOME", async () => {
     const original = [
       'model_provider = "omlx"',
       "",
@@ -590,13 +590,13 @@ describe("selected model_provider env_key readiness", () => {
     const warning = prepared.notes.find((n) => n.startsWith("Warning:"));
     expect(warning).toContain('model_provider "omlx"');
     expect(warning).toContain(GATEWAY_KEY);
-    expect(warning).toContain("user-managed");
+    expect(warning).toContain("does not merge model providers");
     // Read-only: the user's file is byte-for-byte untouched.
     expect(await readConfigToml(home)).toBe(original);
     await prepared.cleanup();
   });
 
-  it("does not warn about a user-managed CODEX_HOME whose env var is set", async () => {
+  it("does not warn about an explicitly configured CODEX_HOME whose env var is set", async () => {
     const home = await makeCodexHome(
       ['model_provider = "omlx"', "[model_providers.omlx]", `env_key = "${GATEWAY_KEY}"`, ""].join(
         "\n",
@@ -612,7 +612,7 @@ describe("selected model_provider env_key readiness", () => {
     await prepared.cleanup();
   });
 
-  it("does not warn about a user-managed CODEX_HOME with no config.toml", async () => {
+  it("does not warn about an explicitly configured CODEX_HOME with no config.toml", async () => {
     const home = await makeCodexHome();
     const prepared = await prepareCodexRuntimeConfig({
       env: {},

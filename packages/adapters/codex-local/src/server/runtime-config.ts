@@ -429,9 +429,9 @@ export async function prepareCodexRuntimeConfig(input: {
   env: Record<string, string>;
   codexHome: string | null;
   /**
-   * The user-supplied `env.CODEX_HOME` when there is one (`codexHome` is null in
-   * that case). Read-only: its config.toml is inspected for diagnostics and
-   * never seeded, merged, or rewritten.
+   * The explicitly configured `env.CODEX_HOME` when there is one (`codexHome` is
+   * null in that case). Read-only: its config.toml is inspected for diagnostics
+   * and never seeded, merged, or rewritten.
    */
   externalCodexHome?: string | null;
   /**
@@ -450,10 +450,10 @@ export async function prepareCodexRuntimeConfig(input: {
     notes,
   );
 
-  // A user-managed home is never seeded or rewritten, but its config can still
-  // select a provider whose env_key is unset. Reading it is free and warning
-  // beats letting codex die on its first model refresh -- but this file is the
-  // user's, so a warning is as far as it goes.
+  // An explicitly configured CODEX_HOME is never merged into or rewritten, but
+  // its config can still select a provider whose env_key is unset. Reading it is
+  // free and warning beats letting codex die on its first model refresh -- but
+  // the merge is off for this home, so a warning is as far as it goes.
   if (input.externalCodexHome) {
     const externalConfigTomlPath = path.join(input.externalCodexHome, "config.toml");
     const externalConfig = await readFileOrNull(externalConfigTomlPath);
@@ -462,7 +462,8 @@ export async function prepareCodexRuntimeConfig(input: {
     if (unset) {
       notes.push(
         `Warning: ${describeUnsetProviderEnvKey(unset, externalConfigTomlPath)} ` +
-          `This home is user-managed, so Paperclip is leaving it as-is.`,
+          `Paperclip does not merge model providers into an explicitly configured CODEX_HOME, ` +
+          `so it is leaving this file as-is.`,
       );
     }
   }
