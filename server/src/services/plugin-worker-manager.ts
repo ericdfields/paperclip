@@ -1022,11 +1022,23 @@ export function createPluginWorkerHandle(
     }
 
     // A scheduled job carries a company only when its manifest declared
-    // `scope: "company"`. An instance-scoped job legitimately has none, gets
-    // no scope, and so its company-scoped host calls stay refused.
+    // `scope: "company"` (PLUGIN_SPEC.md §17.1).
+    //
+    // An instance-scoped job gets a real invocation with an EMPTY company
+    // rather than no invocation at all. The distinction matters: with no
+    // invocation the job's nested worker→host calls carry no id, and
+    // `contextForWorkerMessage` cannot tell "never scoped" from "lost its
+    // scope" — so it denies them whenever any unrelated invocation happens to
+    // be in flight. That makes an instance job fail intermittently, in
+    // proportion to how busy the instance is, reporting a misleading
+    // "missing, expired, or unknown invocation scope".
+    //
+    // An empty company is falsy to `readNonEmptyString`, so
+    // `requireInvocationCompanyScope` still refuses company-scoped calls —
+    // now deterministically, with the accurate "company context is required".
+    // Credit to #9310 / #9368 for isolating this half.
     if (method === "runJob" && isRecord(params.job)) {
-      const companyId = readNonEmptyString(params.job.companyId);
-      return companyId ? { companyId } : null;
+      return { companyId: readNonEmptyString(params.job.companyId) ?? "" };
     }
 
     return null;

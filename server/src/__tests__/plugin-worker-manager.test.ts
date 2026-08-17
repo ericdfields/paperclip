@@ -333,7 +333,7 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
-  it("mints no scope for an instance-scoped job, so its company-scoped host calls stay unscoped", async () => {
+  it("gives an instance-scoped job a real invocation carrying no company", async () => {
     const companiesGet = vi.fn(async (
       params: { companyId: string },
       context?: { invocationScope?: { companyId?: string | null } | null },
@@ -353,10 +353,9 @@ describe("plugin-worker-manager stderr failure context", () => {
     try {
       await handle.start();
 
-      // `companyId: null` is what an instance-scoped job carries. The plugin
-      // asking for a company anyway must not be an authorization source — the
-      // host handler sees no invocation scope and it is the SDK's
-      // requireInvocationCompanyScope that then refuses.
+      // An invocation IS registered, so the nested call has a valid id to echo
+      // and cannot be denied just because unrelated work is in flight. The
+      // company it carries is empty, which is what withholds authorization.
       await expect(handle.call("runJob", {
         job: {
           jobKey: "sweep",
@@ -364,13 +363,62 @@ describe("plugin-worker-manager stderr failure context", () => {
           trigger: "schedule",
           scheduledAt: new Date(0).toISOString(),
           companyId: null,
-          probe: { mode: "omit", requestedCompanyId: "company-a" },
+          probe: { mode: "echo", requestedCompanyId: "company-a" },
         },
       } as never)).resolves.toEqual({
         id: "company-a",
-        scopedCompanyId: null,
+        scopedCompanyId: "",
       });
-      expect(companiesGet).toHaveBeenCalledWith({ companyId: "company-a" }, {});
+      expect(companiesGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("refuses an instance-scoped job's company-scoped call with the accurate reason, not a race", async () => {
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: {
+          list: vi.fn(async () => []),
+          get: vi.fn(async (params: { companyId: string }) => ({ id: params.companyId })),
+        },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      await handle.start();
+
+      // The message matters as much as the refusal. "company context is
+      // required" tells a plugin author to declare `scope: "company"`;
+      // "missing, expired, or unknown invocation scope" — what an unregistered
+      // invocation produced whenever the instance was busy — sends them
+      // hunting a TTL bug that does not exist.
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "sweep",
+          runId: "run-1",
+          trigger: "schedule",
+          scheduledAt: new Date(0).toISOString(),
+          companyId: null,
+          probe: { mode: "echo", requestedCompanyId: "company-a" },
+        },
+      } as never)).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        message: expect.stringContaining("company context is required"),
+      });
     } finally {
       await handle.stop().catch(() => undefined);
     }
