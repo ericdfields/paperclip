@@ -99,18 +99,39 @@ const createActivitySchema = z.object({
   details: z.record(z.unknown()).optional().nullable(),
 });
 
-// Inclusive `createdAt` bounds. Before BRO-2207 these were accepted from
-// callers but never read, so a date-windowed query silently returned the
-// most-recent page instead of the requested range. Malformed dates are
-// rejected rather than dropped — silently widening a bounded query back to
-// "everything" is the exact failure this endpoint just had.
+// Inclusive `createdAt` bounds. These were previously accepted from callers
+// but never read, so a date-windowed query silently returned the most-recent
+// page instead of the requested range. Malformed dates are rejected rather
+// than dropped — silently widening a bounded query back to "everything" is
+// the exact failure this endpoint just had.
 //
+// Parsing is restricted to real ISO-8601 forms rather than `z.coerce.date()`.
+// Coercion delegates to `new Date(string)`, which also accepts host-specific
+// formats such as `"Aug 10 2026"` and `"2026/08/10"`. Those parse against the
+// server's local timezone, so the same request would select a different
+// window depending on where it ran. A date-only bound is widened to that whole
+// UTC day, which keeps `?since=2026-08-10&until=2026-08-16` meaning the seven
+// full days a reader expects.
+const isoDateOnly = /^\d{4}-\d{2}-\d{2}$/;
+const isoDateTime = z.string().datetime({ offset: true });
+
+function isoBound(edge: "start" | "end") {
+  const dayEdge = edge === "start" ? "T00:00:00.000Z" : "T23:59:59.999Z";
+  return z
+    .string()
+    .refine((value) => isoDateOnly.test(value) || isoDateTime.safeParse(value).success, {
+      message: "Expected an ISO-8601 date (YYYY-MM-DD) or date-time (YYYY-MM-DDTHH:mm:ssZ)",
+    })
+    .transform((value) => new Date(isoDateOnly.test(value) ? `${value}${dayEdge}` : value))
+    .optional();
+}
+
 // `limit`/`offset` stay deliberately lenient (coerced then clamped, never
 // 400) to preserve the endpoint's existing contract for callers that pass
 // oversized values and rely on capping.
 const companyActivityQuerySchema = z.object({
-  since: z.coerce.date().optional(),
-  until: z.coerce.date().optional(),
+  since: isoBound("start"),
+  until: isoBound("end"),
 });
 
 const agentActionAuditActorScopeSchema = z.enum(["agents", "all"]);

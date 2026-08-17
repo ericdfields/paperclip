@@ -251,7 +251,7 @@ describe.sequential("activity routes", () => {
     });
   });
 
-  it("forwards since/until/offset to the activity query (BRO-2207)", async () => {
+  it("forwards since/until/offset to the activity query", async () => {
     mockActivityService.list.mockResolvedValue([]);
 
     const app = await createApp();
@@ -274,9 +274,9 @@ describe.sequential("activity routes", () => {
     });
   });
 
-  // Category safeguard for BRO-2207: the underlying defect was a query param
-  // the route accepted and then silently dropped, so a bounded query quietly
-  // returned unbounded data. Any param documented in docs/api/activity.md must
+  // Category safeguard: the underlying defect was a query param the route
+  // accepted and then silently dropped, so a bounded query quietly returned
+  // unbounded data. Any param documented in docs/api/activity.md must
   // demonstrably reach the service layer.
   it.each([
     ["agentId", "agent-9", "agentId", "agent-9"],
@@ -300,16 +300,45 @@ describe.sequential("activity routes", () => {
     );
   });
 
-  it("rejects a malformed since bound instead of silently ignoring it", async () => {
+  // `new Date(string)` accepts each of these, and resolves the ones without a
+  // zone against the server's local timezone — so the same request would
+  // select a different window depending on where it ran. Rejecting beats
+  // quietly answering a question the caller did not ask.
+  it.each([
+    ["last-tuesday", "not a date at all"],
+    ["Aug 10 2026", "host-specific format, no zone"],
+    ["2026/08/10", "host-specific format, no zone"],
+    ["2026-08-10T00:00:00", "ISO shape but no zone, so locale-dependent"],
+    ["1786060800000", "epoch millis, not ISO-8601"],
+  ])("rejects since=%s (%s) instead of silently ignoring it", async (raw) => {
     mockActivityService.list.mockResolvedValue([]);
 
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).get("/api/companies/company-1/activity?since=last-tuesday"),
+      request(baseUrl).get(`/api/companies/company-1/activity?since=${encodeURIComponent(raw)}`),
     );
 
     expect(res.status).toBe(400);
     expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("widens a bare date bound to cover that whole UTC day", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?since=2026-08-10&until=2026-08-16"),
+    );
+
+    expect(res.status).toBe(200);
+    // `until` lands at end-of-day, not midnight: `since=2026-08-10&until=2026-08-16`
+    // has to mean seven full days, otherwise the last day is silently dropped.
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({
+        since: new Date("2026-08-10T00:00:00.000Z"),
+        until: new Date("2026-08-16T23:59:59.999Z"),
+      }),
+    );
   });
 
   it("resolves alphanumeric issue identifiers before loading runs", async () => {

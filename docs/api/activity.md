@@ -18,20 +18,33 @@ Query parameters:
 | `agentId` | Filter by actor agent |
 | `entityType` | Filter by entity type (`issue`, `agent`, `approval`) |
 | `entityId` | Filter by specific entity |
-| `since` | ISO-8601 timestamp; only records with `createdAt >= since` (inclusive) |
-| `until` | ISO-8601 timestamp; only records with `createdAt <= until` (inclusive) |
+| `since` | ISO-8601 bound; only records with `createdAt >= since` (inclusive) |
+| `until` | ISO-8601 bound; only records with `createdAt <= until` (inclusive) |
 | `limit` | Page size, 1–1000 (default 100). Out-of-range values are clamped, not rejected |
 | `offset` | Rows to skip for pagination (default 0) |
 
-An unparseable `since`/`until` returns `400` rather than being ignored.
+`since` and `until` accept a date-time (`2026-08-10T00:00:00Z`, offsets
+allowed) or a bare date (`2026-08-10`). A bare date covers that whole UTC day,
+so `?since=2026-08-10&until=2026-08-16` returns those seven full days. Any
+other format returns `400` rather than being ignored — the endpoint will not
+silently widen a bounded query back to "everything".
 
 Records come back newest-first, ordered by `createdAt` then `id`. The `id`
 tiebreaker makes a given `(limit, offset)` pair address a stable row, so
 paging through a window will not skip or repeat records when several share a
 timestamp.
 
-To pull a full window larger than one page, walk `offset` until a page comes
-back short:
+### Paging a window
+
+Always pass `until` when you page. Each request re-runs the query, so `offset`
+is only meaningful against a result set that cannot change between requests.
+Records are written with `createdAt` set to the present, and rows are returned
+newest-first, so a pinned `until` in the past freezes the result set: anything
+written mid-sweep sorts after `until` and is excluded. Without `until`, a
+concurrent write shifts every later row by one position and the sweep repeats
+records.
+
+Pin `until`, then walk `offset` until a page comes back short:
 
 ```bash
 OFFSET=0

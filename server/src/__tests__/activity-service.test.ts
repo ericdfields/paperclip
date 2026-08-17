@@ -117,7 +117,7 @@ describeEmbeddedPostgres("activity service", () => {
     expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
   });
 
-  describe("date-windowed company activity (BRO-2207)", () => {
+  describe("date-windowed company activity", () => {
     async function seedWindowCompany() {
       const companyId = randomUUID();
 
@@ -182,8 +182,8 @@ describeEmbeddedPostgres("activity service", () => {
         requireBoardApprovalForNewAgents: false,
       });
 
-      // Must exceed the old 500 cap, otherwise clamping is invisible: the
-      // weekly founder-leverage report asks for limit=1000 and used to get 500.
+      // Must exceed the old 500 cap, otherwise clamping is invisible: a caller
+      // asking for limit=1000 used to get 500 with no indication of truncation.
       await db.insert(activityLog).values(
         Array.from({ length: 600 }, (_, i) => ({
           companyId,
@@ -252,6 +252,48 @@ describeEmbeddedPostgres("activity service", () => {
       // Without the id tiebreaker, equal-timestamp rows can reorder between
       // queries and a paginated sweep silently loses records.
       expect(new Set(paged).size).toBe(10);
+    });
+
+    it("keeps a pinned-until sweep stable while new activity is written", async () => {
+      const companyId = await seedWindowCompany();
+      const svc = activityService(db);
+      const filters = {
+        companyId,
+        since: new Date("2026-08-10T00:00:00.000Z"),
+        until: new Date("2026-08-17T00:00:00.000Z"),
+      };
+
+      // Offset paging is only sound against a result set that cannot change
+      // between requests. `until` is what supplies that: records are written
+      // with createdAt at the present, so a bound in the past excludes them and
+      // the sweep sees a frozen window. Interleave writes to prove it — without
+      // `until`, each insert shifts every later row by one and the sweep
+      // repeats records.
+      const paged: string[] = [];
+      for (let offset = 0; offset < 9; offset += 3) {
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "system" as const,
+          actorId: "system",
+          action: `test.concurrent${offset}`,
+          entityType: "company",
+          entityId: companyId,
+          createdAt: new Date("2026-08-20T12:00:00.000Z"),
+        });
+
+        const page = await svc.list({ ...filters, limit: 3, offset });
+        paged.push(...page.map((e) => e.action));
+      }
+
+      expect(paged).toEqual([
+        "test.aug16",
+        "test.aug15",
+        "test.aug14",
+        "test.aug13",
+        "test.aug12",
+        "test.aug11",
+        "test.aug10",
+      ]);
     });
   });
 
