@@ -1021,6 +1021,14 @@ export function createPluginWorkerHandle(
       return companyId ? { companyId } : null;
     }
 
+    // A scheduled job carries a company only when its manifest declared
+    // `scope: "company"`. An instance-scoped job legitimately has none, gets
+    // no scope, and so its company-scoped host calls stay refused.
+    if (method === "runJob" && isRecord(params.job)) {
+      const companyId = readNonEmptyString(params.job.companyId);
+      return companyId ? { companyId } : null;
+    }
+
     return null;
   }
 

@@ -591,6 +591,7 @@ The host provides:
 - trigger source
 - run id
 - schedule metadata
+- company id — the company this run is scoped to, or `null` for an instance-scoped job (see §17.1)
 
 ### 13.7 `handleWebhook`
 
@@ -976,10 +977,26 @@ Job rules:
 
 1. Each job has a stable `job_key`.
 2. The host is the scheduler of record.
-3. The host prevents overlapping execution of the same plugin/job combination unless explicitly allowed later.
+3. The host prevents overlapping execution of the same plugin/job/target combination unless explicitly allowed later. The target is a company for a company-scoped job and the instance otherwise.
 4. Every job run is recorded in Postgres.
 5. Failed jobs are retryable.
 6. For recurring business workflows that should create visible Paperclip work, prefer managed routines and managed resources over jobs. Jobs remain useful for private plugin-runtime maintenance tasks.
+
+### 17.1 Job scope
+
+A job declaration carries an optional `scope`, `"instance"` (the default) or `"company"`.
+
+| | `scope: "instance"` | `scope: "company"` |
+| --- | --- | --- |
+| Runs per tick | one | one per company the plugin is enabled for |
+| `job.companyId` in the handler | `null` | that company's id |
+| Company-scoped host calls | **refused** | authorized for that company |
+
+"Company-scoped host calls" means anything that takes a company: `ctx.config.get`, `ctx.secrets.resolve`, `ctx.issues.*`, and `state` at company scope. The invocation scope the host mints from `job.companyId` is the *only* thing that authorizes them — a `companyId` the plugin supplies itself is compared against the host scope, never accepted in place of one. An instance-scoped job therefore cannot reach company data by any route; that is by design, and a job that needs company data must declare `scope: "company"`.
+
+A company is "enabled" for a plugin when the company is `active` and has no `plugin_company_settings` row disabling the plugin (absence of a row means enabled). A company-scoped job on an instance with no such companies dispatches nothing, which is not an error.
+
+Job *definitions* stay plugin-global — `plugin_jobs` has no company column, one row per `(plugin, job_key)`. Only runs are scoped: `plugin_job_runs.company_id` records the company a run fired for, and is `NULL` for an instance-scoped run.
 
 ## 18. Webhooks
 

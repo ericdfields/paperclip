@@ -291,6 +291,91 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("passes a company-scoped job's invocation scope to nested worker host calls", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "sweep",
+          runId: "run-1",
+          trigger: "schedule",
+          scheduledAt: new Date(0).toISOString(),
+          companyId: "company-a",
+          probe: { mode: "echo", requestedCompanyId: "company-a" },
+        },
+      } as never)).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: "company-a",
+      });
+      expect(companiesGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("mints no scope for an instance-scoped job, so its company-scoped host calls stay unscoped", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+
+    try {
+      await handle.start();
+
+      // `companyId: null` is what an instance-scoped job carries. The plugin
+      // asking for a company anyway must not be an authorization source — the
+      // host handler sees no invocation scope and it is the SDK's
+      // requireInvocationCompanyScope that then refuses.
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "sweep",
+          runId: "run-1",
+          trigger: "schedule",
+          scheduledAt: new Date(0).toISOString(),
+          companyId: null,
+          probe: { mode: "omit", requestedCompanyId: "company-a" },
+        },
+      } as never)).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: null,
+      });
+      expect(companiesGet).toHaveBeenCalledWith({ companyId: "company-a" }, {});
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("passes echoed invocation scope to worker-to-host handlers", async () => {
     const companiesGet = vi.fn(async () => ({ id: "company-1" }));
     const handle = createPluginWorkerHandle("test.plugin", {

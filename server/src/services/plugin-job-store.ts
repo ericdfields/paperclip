@@ -22,6 +22,9 @@
  *    `updateNextRunAt()` with the next cron tick so the scheduler knows when
  *    to fire next.
  *
+ * 5. **Company fan-out set** — `listEnabledCompanyIds()` answers "which
+ *    companies does a `scope: "company"` job run for on this tick".
+ *
  * The capability check (`jobs.schedule`) is enforced upstream by the host
  * client factory and manifest validator — this store trusts that the caller
  * has already been authorised.
@@ -30,14 +33,21 @@
  * @see PLUGIN_SPEC.md §21.3 — `plugin_jobs` / `plugin_job_runs` tables
  */
 
-import { and, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, notExists } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { plugins, pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import {
+  companies,
+  plugins,
+  pluginCompanySettings,
+  pluginJobs,
+  pluginJobRuns,
+} from "@paperclipai/db";
 import type {
   PluginJobDeclaration,
   PluginJobRunStatus,
   PluginJobRunTrigger,
   PluginJobRecord,
+  PluginJobScope,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 
@@ -62,6 +72,11 @@ export interface CreateJobRunInput {
   pluginId: string;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
+  /**
+   * Company this run is scoped to, or `null`/omitted for an instance-scoped
+   * run. `null` is the explicit instance marker — not "unknown".
+   */
+  companyId?: string | null;
 }
 
 /**
@@ -165,14 +180,18 @@ export function pluginJobStore(db: Db) {
 
         const existing = existingByKey.get(decl.jobKey);
         const schedule = decl.schedule ?? "";
+        const scope: PluginJobScope = decl.scope ?? "instance";
 
         if (existing) {
-          // Update schedule if it changed; re-activate if it was paused
+          // Update schedule/scope if they changed; re-activate if it was paused
           const updates: Record<string, unknown> = {
             updatedAt: new Date(),
           };
           if (existing.schedule !== schedule) {
             updates.schedule = schedule;
+          }
+          if (existing.scope !== scope) {
+            updates.scope = scope;
           }
           if (existing.status === "paused") {
             updates.status = "active";
@@ -188,6 +207,7 @@ export function pluginJobStore(db: Db) {
             pluginId,
             jobKey: decl.jobKey,
             schedule,
+            scope,
             status: "active",
           });
         }
@@ -202,6 +222,46 @@ export function pluginJobStore(db: Db) {
             .where(eq(pluginJobs.id, existing.id));
         }
       }
+    },
+
+    /**
+     * List the companies a `scope: "company"` job should fan out to.
+     *
+     * Plugins are installed instance-wide, so "enabled for a company" is the
+     * opt-out semantic documented on `plugin_company_settings`: a company is
+     * in scope unless it has a row with `enabled = false`. Companies that are
+     * not `active` (paused/suspended) are excluded — a paused company should
+     * not have background work run against it.
+     *
+     * Ordered by id so a fan-out is deterministic across ticks.
+     *
+     * @param pluginId - UUID of the plugin
+     * @returns Company UUIDs, possibly empty
+     */
+    async listEnabledCompanyIds(pluginId: string): Promise<string[]> {
+      const rows = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(
+          and(
+            eq(companies.status, "active"),
+            notExists(
+              db
+                .select({ one: pluginCompanySettings.id })
+                .from(pluginCompanySettings)
+                .where(
+                  and(
+                    eq(pluginCompanySettings.pluginId, pluginId),
+                    eq(pluginCompanySettings.companyId, companies.id),
+                    eq(pluginCompanySettings.enabled, false),
+                  ),
+                ),
+            ),
+          ),
+        )
+        .orderBy(asc(companies.id));
+
+      return rows.map((row) => row.id);
     },
 
     /**
@@ -356,6 +416,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })
