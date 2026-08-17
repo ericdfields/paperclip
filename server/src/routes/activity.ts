@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { activityService, normalizeActivityLimit } from "../services/activity.js";
+import { activityService, normalizeActivityLimit, normalizeActivityOffset } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
@@ -82,7 +82,10 @@ export function activityRoutes(db: Db) {
       agentId: req.query.agentId as string | undefined,
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
+      since: req.query.since ? new Date(req.query.since as string) : undefined,
+      until: req.query.until ? new Date(req.query.until as string) : undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
+      offset: normalizeActivityOffset(Number(req.query.offset)),
     };
     const result = await svc.list(filters);
     res.json(result);

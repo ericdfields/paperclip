@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -24,15 +24,25 @@ export interface ActivityFilters {
   agentId?: string;
   entityType?: string;
   entityId?: string;
+  /** Inclusive lower bound on `createdAt`. */
+  since?: Date;
+  /** Inclusive upper bound on `createdAt`. */
+  until?: Date;
   limit?: number;
+  offset?: number;
 }
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
-const MAX_ACTIVITY_LIMIT = 500;
+export const MAX_ACTIVITY_LIMIT = 1000;
 
 export function normalizeActivityLimit(limit: number | undefined) {
   if (!Number.isFinite(limit)) return DEFAULT_ACTIVITY_LIMIT;
   return Math.max(1, Math.min(MAX_ACTIVITY_LIMIT, Math.floor(limit ?? DEFAULT_ACTIVITY_LIMIT)));
+}
+
+export function normalizeActivityOffset(offset: number | undefined) {
+  if (!Number.isFinite(offset)) return 0;
+  return Math.max(0, Math.floor(offset ?? 0));
 }
 
 export function activityService(db: Db) {
@@ -339,6 +349,14 @@ export function activityService(db: Db) {
       if (filters.entityId) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
       }
+      if (filters.since) {
+        conditions.push(gte(activityLog.createdAt, filters.since));
+      }
+      if (filters.until) {
+        conditions.push(lte(activityLog.createdAt, filters.until));
+      }
+
+      const offset = normalizeActivityOffset(filters.offset);
 
       return db
         .select({ activityLog })
@@ -361,6 +379,7 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(activityLog.createdAt))
         .limit(limit)
+        .offset(offset)
         .then((rows) => rows.map((r) => r.activityLog));
     },
 
