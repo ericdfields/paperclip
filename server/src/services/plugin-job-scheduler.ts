@@ -276,6 +276,18 @@ export function createPluginJobScheduler(
     return [...activeRuns].filter((key) => key.startsWith(prefix));
   }
 
+  /**
+   * Where each job's fan-out should resume next tick, when the concurrency cap
+   * cut it short.
+   *
+   * `listEnabledCompanyIds` is deterministically ordered, so without this a
+   * fan-out wider than `maxConcurrentJobs` would admit the *same* prefix every
+   * tick and the tail would never run at all — not late, never. Resuming from
+   * the first company we could not admit turns the cap into a delay instead of
+   * a starvation. In-memory only; a restart just resumes from the top.
+   */
+  const fanOutCursor = new Map<string, string | null>();
+
   /** Total number of ticks since start. */
   let tickCount = 0;
 
@@ -412,10 +424,21 @@ export function createPluginJobScheduler(
         return;
       }
 
+      // Resume the fan-out where the cap cut it short last tick.
+      const resumeAt = fanOutCursor.get(jobId);
+      const resumeIndex = resumeAt === undefined
+        ? 0
+        : Math.max(0, targets.indexOf(resumeAt));
+      const ordered = resumeIndex === 0
+        ? targets
+        : [...targets.slice(resumeIndex), ...targets.slice(0, resumeIndex)];
+
       // Admit targets synchronously so a concurrent tick or manual trigger
       // cannot slip past the overlap check while we await below.
       const admitted: { companyId: string | null; key: string }[] = [];
-      for (const companyId of targets) {
+      let deferredFrom: string | null | undefined;
+
+      for (const [index, companyId] of ordered.entries()) {
         const key = runKey(jobId, companyId);
 
         if (activeRuns.has(key)) {
@@ -427,15 +450,27 @@ export function createPluginJobScheduler(
         }
 
         if (activeRuns.size >= maxConcurrentJobs) {
+          deferredFrom = companyId;
           jobLog.warn(
-            { maxConcurrentJobs, activeJobCount: activeRuns.size },
-            "max concurrent jobs reached, deferring remaining targets",
+            {
+              maxConcurrentJobs,
+              activeJobCount: activeRuns.size,
+              deferredCount: ordered.length - index,
+              resumesAtCompanyId: companyId,
+            },
+            "max concurrent jobs reached — deferring the rest of the fan-out to the next tick",
           );
           break;
         }
 
         activeRuns.add(key);
         admitted.push({ companyId, key });
+      }
+
+      if (deferredFrom === undefined) {
+        fanOutCursor.delete(jobId);
+      } else {
+        fanOutCursor.set(jobId, deferredFrom);
       }
 
       if (admitted.length > 0) {
@@ -853,6 +888,7 @@ export function createPluginJobScheduler(
       for (const key of activeRunKeysForJob(job.id)) {
         activeRuns.delete(key);
       }
+      fanOutCursor.delete(job.id);
     }
   }
 

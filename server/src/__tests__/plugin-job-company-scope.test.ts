@@ -118,7 +118,9 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
    * A scheduler wired to the real store and DB, with the worker faked so the
    * test can read exactly what the `runJob` RPC would have carried.
    */
-  function createHarness(options: { runJob?: () => Promise<void> } = {}) {
+  function createHarness(
+    options: { runJob?: () => Promise<void>; maxConcurrentJobs?: number } = {},
+  ) {
     const jobStore = pluginJobStore(db);
     const captured: CapturedJob[] = [];
 
@@ -133,7 +135,14 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
       }),
     } as any;
 
-    const scheduler = createPluginJobScheduler({ db, jobStore, workerManager });
+    const scheduler = createPluginJobScheduler({
+      db,
+      jobStore,
+      workerManager,
+      ...(options.maxConcurrentJobs !== undefined
+        ? { maxConcurrentJobs: options.maxConcurrentJobs }
+        : {}),
+    });
     return { jobStore, workerManager, scheduler, captured };
   }
 
@@ -370,6 +379,45 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
     const byCompany = new Map(runs.map((run) => [run.companyId, run.status]));
     expect(byCompany.get(failFor)).toBe("failed");
     expect([...byCompany.values()].filter((status) => status === "succeeded")).toHaveLength(1);
+  });
+
+  it("serves every company across ticks when the fan-out is wider than the concurrency cap", async () => {
+    const pluginId = await seedPlugin();
+    const seeded: string[] = [];
+    for (let i = 0; i < 5; i += 1) seeded.push(await seedCompany(`company ${i}`));
+    const jobId = await seedDueJob(pluginId, "company");
+
+    // The fan-out set is deterministically ordered, so without a resume cursor
+    // the same two companies would be admitted on every tick and the other
+    // three would never run — starvation, not lateness.
+    const { scheduler, captured } = createHarness({ maxConcurrentJobs: 2 });
+
+    // Group by tick. The runs admitted within one tick are dispatched
+    // concurrently, so their arrival order is not deterministic — only the set
+    // per tick is.
+    const perTick: string[][] = [];
+    for (let tick = 0; tick < 3; tick += 1) {
+      const before = captured.length;
+      await db
+        .update(pluginJobs)
+        .set({ nextRunAt: new Date(Date.now() - 60_000) })
+        .where(eq(pluginJobs.id, jobId));
+      await scheduler.tick();
+      perTick.push(captured.slice(before).map((job) => job.companyId as string));
+    }
+
+    // The starvation guarantee: three ticks at two per tick reach all five.
+    const served = new Set(captured.map((job) => job.companyId));
+    expect([...served].sort()).toEqual([...seeded].sort());
+
+    // Each tick honors the cap exactly, and the cursor advances rather than
+    // replaying — the first two ticks must cover four distinct companies.
+    expect(perTick.map((tick) => tick.length)).toEqual([2, 2, 2]);
+    expect(new Set([...perTick[0]!, ...perTick[1]!]).size).toBe(4);
+
+    const runs = await runsForJob(jobId);
+    expect(runs).toHaveLength(6);
+    expect(runs.every((run) => run.companyId !== null)).toBe(true);
   });
 
   // -------------------------------------------------------------------------
