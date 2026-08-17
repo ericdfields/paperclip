@@ -23,7 +23,9 @@
  *    to fire next.
  *
  * 5. **Company fan-out set** — `listEnabledCompanyIds()` answers "which
- *    companies does a `scope: "company"` job run for on this tick".
+ *    companies is this plugin enabled for", and `listFanOutCompanyIds()`
+ *    orders that set least-recently-run-first for one job, so a fan-out wider
+ *    than the scheduler's concurrency cap stays fair across occurrences.
  *
  * The capability check (`jobs.schedule`) is enforced upstream by the host
  * client factory and manifest validator — this store trusts that the caller
@@ -33,7 +35,7 @@
  * @see PLUGIN_SPEC.md §21.3 — `plugin_jobs` / `plugin_job_runs` tables
  */
 
-import { and, asc, desc, eq, notExists } from "drizzle-orm";
+import { and, asc, desc, eq, notExists, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
@@ -119,6 +121,29 @@ export function pluginJobStore(db: Db) {
   // -----------------------------------------------------------------------
   // Internal helpers
   // -----------------------------------------------------------------------
+
+  /**
+   * "Enabled for this company" per the opt-out semantic documented on
+   * `plugin_company_settings`: no row means enabled, a row with
+   * `enabled = false` means disabled. Non-`active` companies are excluded.
+   */
+  function enabledCompanyConditions(pluginId: string) {
+    return [
+      eq(companies.status, "active"),
+      notExists(
+        db
+          .select({ one: pluginCompanySettings.id })
+          .from(pluginCompanySettings)
+          .where(
+            and(
+              eq(pluginCompanySettings.pluginId, pluginId),
+              eq(pluginCompanySettings.companyId, companies.id),
+              eq(pluginCompanySettings.enabled, false),
+            ),
+          ),
+      ),
+    ];
+  }
 
   async function assertPluginExists(pluginId: string): Promise<void> {
     const rows = await db
@@ -233,7 +258,8 @@ export function pluginJobStore(db: Db) {
      * not `active` (paused/suspended) are excluded — a paused company should
      * not have background work run against it.
      *
-     * Ordered by id so a fan-out is deterministic across ticks.
+     * Ordered by id so membership checks are deterministic. For dispatch
+     * ordering use {@link listFanOutCompanyIds}, which is fairness-ordered.
      *
      * @param pluginId - UUID of the plugin
      * @returns Company UUIDs, possibly empty
@@ -242,24 +268,47 @@ export function pluginJobStore(db: Db) {
       const rows = await db
         .select({ id: companies.id })
         .from(companies)
-        .where(
-          and(
-            eq(companies.status, "active"),
-            notExists(
-              db
-                .select({ one: pluginCompanySettings.id })
-                .from(pluginCompanySettings)
-                .where(
-                  and(
-                    eq(pluginCompanySettings.pluginId, pluginId),
-                    eq(pluginCompanySettings.companyId, companies.id),
-                    eq(pluginCompanySettings.enabled, false),
-                  ),
-                ),
-            ),
-          ),
-        )
+        .where(and(...enabledCompanyConditions(pluginId)))
         .orderBy(asc(companies.id));
+
+      return rows.map((row) => row.id);
+    },
+
+    /**
+     * The same set as {@link listEnabledCompanyIds}, ordered
+     * least-recently-run-first for one specific job.
+     *
+     * A job with more enabled companies than the scheduler's concurrency cap
+     * cannot serve them all in one occurrence. That is capacity, not something
+     * the scheduler can fix. What it *can* control is who gets left out and for
+     * how long — and a stable ordering (by company id, say) is the worst
+     * possible answer, because the same prefix wins every occurrence and the
+     * tail never runs at all.
+     *
+     * Ordering by each company's most recent run **for this job**, with
+     * never-run companies first, makes that fair without any in-process state:
+     * serving a company moves it to the back. A company gets a second run only
+     * after every company has had a first, new companies go straight to the
+     * front, and — unlike a remembered cursor — this survives a restart,
+     * because it is derived from `plugin_job_runs` rather than from memory.
+     *
+     * @param pluginId - UUID of the plugin
+     * @param jobId - UUID of the job whose run history orders the fan-out
+     * @returns Company UUIDs, possibly empty
+     */
+    async listFanOutCompanyIds(pluginId: string, jobId: string): Promise<string[]> {
+      const lastRunAt = sql<Date | null>`(
+        select max(${pluginJobRuns.createdAt})
+        from ${pluginJobRuns}
+        where ${pluginJobRuns.jobId} = ${jobId}
+          and ${pluginJobRuns.companyId} = ${companies.id}
+      )`;
+
+      const rows = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(and(...enabledCompanyConditions(pluginId)))
+        .orderBy(sql`${lastRunAt} asc nulls first`, asc(companies.id));
 
       return rows.map((row) => row.id);
     },

@@ -276,26 +276,6 @@ export function createPluginJobScheduler(
     return [...activeRuns].filter((key) => key.startsWith(prefix));
   }
 
-  /**
-   * Targets still owed a run from a fan-out the concurrency cap cut short.
-   *
-   * A job with more enabled companies than `maxConcurrentJobs` cannot serve
-   * them all in one pass — that is a capacity fact, not something the scheduler
-   * can fix. What it *can* control is who gets left out and for how long.
-   *
-   * Without this, the deferred tail is dropped: `listEnabledCompanyIds` is
-   * deterministically ordered, so the same prefix would be admitted on every
-   * later occurrence and the tail would never run at all — not late, never.
-   *
-   * Carrying the remainder forward finishes the interrupted pass before
-   * starting a new one, so a pass over N companies simply takes
-   * `ceil(N / maxConcurrentJobs)` occurrences and no company gets a second run
-   * before every company has had its first.
-   *
-   * In-memory only. A restart drops the remainder and begins a fresh pass,
-   * which costs at most one delayed run and never a duplicate.
-   */
-  const pendingFanOut = new Map<string, (string | null)[]>();
 
   /** Total number of ticks since start. */
   let tickCount = 0;
@@ -398,17 +378,21 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /**
-   * Resolve the companies one due job fires for on this tick.
+   * Resolve the companies one due job fires for on this tick, in the order
+   * they should be admitted.
    *
    * An instance-scoped job has exactly one target: `null`, the instance.
    * A company-scoped job has one target per company the plugin is enabled
-   * for — possibly none, on an instance with no companies.
+   * for — possibly none, on an instance with no companies — ordered
+   * least-recently-run first so that a fan-out wider than
+   * `maxConcurrentJobs` still reaches everyone. See
+   * `plugin-job-store.listFanOutCompanyIds`.
    */
   async function resolveJobTargets(
     job: typeof pluginJobs.$inferSelect,
   ): Promise<(string | null)[]> {
     if (job.scope !== "company") return [null];
-    return jobStore.listEnabledCompanyIds(job.pluginId);
+    return jobStore.listFanOutCompanyIds(job.pluginId, job.id);
   }
 
   /**
@@ -423,19 +407,11 @@ export function createPluginJobScheduler(
     const jobLog = log.child({ jobId, pluginId, jobKey, scope: job.scope });
 
     try {
-      const enabled = await resolveJobTargets(job);
-
-      // Finish an interrupted pass before starting a new one, so no company
-      // gets a second run while another is still waiting for its first. Drop
-      // anything from the remainder that is no longer enabled; if that empties
-      // it, the pass is over and a fresh one starts.
-      const carried = pendingFanOut.get(jobId) ?? [];
-      const enabledSet = new Set(enabled);
-      const remaining = carried.filter((companyId) => enabledSet.has(companyId));
-      const targets = remaining.length > 0 ? remaining : enabled;
+      // Least-recently-run first, so the companies the cap turned away last
+      // occurrence are at the front of this one.
+      const targets = await resolveJobTargets(job);
 
       if (targets.length === 0) {
-        pendingFanOut.delete(jobId);
         jobLog.info(
           {},
           "company-scoped job has no enabled companies — nothing to dispatch",
@@ -446,13 +422,10 @@ export function createPluginJobScheduler(
       // Admit targets synchronously so a concurrent tick or manual trigger
       // cannot slip past the overlap check while we await below.
       const admitted: { companyId: string | null; key: string }[] = [];
-      let deferred: (string | null)[] = [];
 
       for (const [index, companyId] of targets.entries()) {
         const key = runKey(jobId, companyId);
 
-        // Already in flight, so it is being served — owed nothing, and not
-        // carried forward.
         if (activeRuns.has(key)) {
           jobLog.debug(
             { companyId },
@@ -462,29 +435,21 @@ export function createPluginJobScheduler(
         }
 
         if (activeRuns.size >= maxConcurrentJobs) {
-          deferred = targets
-            .slice(index)
-            .filter((pending) => !activeRuns.has(runKey(jobId, pending)));
           jobLog.warn(
             {
               maxConcurrentJobs,
               activeJobCount: activeRuns.size,
-              deferredCount: deferred.length,
-              resumesAtCompanyId: companyId,
+              deferredCount: targets.length - index,
+              deferredFromCompanyId: companyId,
             },
-            "max concurrent jobs reached — carrying the rest of this pass to the next occurrence",
+            "max concurrent jobs reached — deferring the rest of the fan-out; "
+              + "least-recently-run ordering puts these first next occurrence",
           );
           break;
         }
 
         activeRuns.add(key);
         admitted.push({ companyId, key });
-      }
-
-      if (deferred.length > 0) {
-        pendingFanOut.set(jobId, deferred);
-      } else {
-        pendingFanOut.delete(jobId);
       }
 
       if (admitted.length > 0) {
@@ -902,7 +867,6 @@ export function createPluginJobScheduler(
       for (const key of activeRunKeysForJob(job.id)) {
         activeRuns.delete(key);
       }
-      pendingFanOut.delete(job.id);
     }
   }
 
