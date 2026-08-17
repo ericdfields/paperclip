@@ -30,9 +30,14 @@ const mockAgentActionAuditService = vi.hoisted(() => ({
 
 vi.mock("../services/activity.js", () => ({
   activityService: () => mockActivityService,
+  MAX_ACTIVITY_LIMIT: 1000,
   normalizeActivityLimit: (limit: number | undefined) => {
     if (!Number.isFinite(limit)) return 100;
-    return Math.max(1, Math.min(500, Math.floor(limit ?? 100)));
+    return Math.max(1, Math.min(1000, Math.floor(limit ?? 100)));
+  },
+  normalizeActivityOffset: (offset: number | undefined) => {
+    if (!Number.isFinite(offset)) return 0;
+    return Math.max(0, Math.floor(offset ?? 0));
   },
 }));
 
@@ -218,7 +223,10 @@ describe.sequential("activity routes", () => {
       agentId: undefined,
       entityType: undefined,
       entityId: undefined,
+      since: undefined,
+      until: undefined,
       limit: 100,
+      offset: 0,
     });
   });
 
@@ -236,8 +244,72 @@ describe.sequential("activity routes", () => {
       agentId: undefined,
       entityType: "issue",
       entityId: undefined,
-      limit: 500,
+      since: undefined,
+      until: undefined,
+      limit: 1000,
+      offset: 0,
     });
+  });
+
+  it("forwards since/until/offset to the activity query (BRO-2207)", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(
+        "/api/companies/company-1/activity?since=2026-08-10T00:00:00Z&until=2026-08-17T00:00:00Z&limit=1000&offset=250",
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: undefined,
+      entityType: undefined,
+      entityId: undefined,
+      since: new Date("2026-08-10T00:00:00.000Z"),
+      until: new Date("2026-08-17T00:00:00.000Z"),
+      limit: 1000,
+      offset: 250,
+    });
+  });
+
+  // Category safeguard for BRO-2207: the underlying defect was a query param
+  // the route accepted and then silently dropped, so a bounded query quietly
+  // returned unbounded data. Any param documented in docs/api/activity.md must
+  // demonstrably reach the service layer.
+  it.each([
+    ["agentId", "agent-9", "agentId", "agent-9"],
+    ["entityType", "issue", "entityType", "issue"],
+    ["entityId", "issue-9", "entityId", "issue-9"],
+    ["since", "2026-08-10T00:00:00Z", "since", new Date("2026-08-10T00:00:00.000Z")],
+    ["until", "2026-08-17T00:00:00Z", "until", new Date("2026-08-17T00:00:00.000Z")],
+    ["limit", "250", "limit", 250],
+    ["offset", "40", "offset", 40],
+  ])("forwards the %s query param to the activity service", async (param, raw, key, expected) => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/companies/company-1/activity?${param}=${encodeURIComponent(raw)}`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ [key]: expected }),
+    );
+  });
+
+  it("rejects a malformed since bound instead of silently ignoring it", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?since=last-tuesday"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
   });
 
   it("resolves alphanumeric issue identifiers before loading runs", async () => {

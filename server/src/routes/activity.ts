@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { activityService, normalizeActivityLimit } from "../services/activity.js";
+import { activityService, normalizeActivityLimit, normalizeActivityOffset } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
@@ -97,6 +97,20 @@ const createActivitySchema = z.object({
   entityId: z.string().min(1),
   agentId: z.string().uuid().optional().nullable(),
   details: z.record(z.unknown()).optional().nullable(),
+});
+
+// Inclusive `createdAt` bounds. Before BRO-2207 these were accepted from
+// callers but never read, so a date-windowed query silently returned the
+// most-recent page instead of the requested range. Malformed dates are
+// rejected rather than dropped — silently widening a bounded query back to
+// "everything" is the exact failure this endpoint just had.
+//
+// `limit`/`offset` stay deliberately lenient (coerced then clamped, never
+// 400) to preserve the endpoint's existing contract for callers that pass
+// oversized values and rely on capping.
+const companyActivityQuerySchema = z.object({
+  since: z.coerce.date().optional(),
+  until: z.coerce.date().optional(),
 });
 
 const agentActionAuditActorScopeSchema = z.enum(["agents", "all"]);
@@ -224,12 +238,20 @@ export function activityRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
 
+    const parsedQuery = companyActivityQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      throw badRequest("Invalid activity query", parsedQuery.error.issues);
+    }
+
     const filters = {
       companyId,
       agentId: req.query.agentId as string | undefined,
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
+      since: parsedQuery.data.since,
+      until: parsedQuery.data.until,
       limit: normalizeActivityLimit(Number(req.query.limit)),
+      offset: normalizeActivityOffset(Number(req.query.offset)),
     };
     const result = await svc.list(filters);
     res.json(result);
