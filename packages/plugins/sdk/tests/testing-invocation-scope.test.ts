@@ -66,15 +66,17 @@ describe("createTestHarness invocation company scope", () => {
       expect((error as Error).message).toMatch(NO_SCOPE);
     });
 
-    it("allows the same call when the job run carries a company", async () => {
+    it("allows the same call when the job handler declares its company", async () => {
       const harness = createTestHarness({ manifest, config: { token: "t" } });
       let config: Record<string, unknown> | undefined;
 
       harness.ctx.jobs.register("sweep", async () => {
-        config = await harness.ctx.config.get(COMPANY_A);
+        await harness.withCompanyScope(COMPANY_A, async () => {
+          config = await harness.ctx.config.get(COMPANY_A);
+        });
       });
 
-      await harness.runJob("sweep", { companyId: COMPANY_A });
+      await harness.runJob("sweep");
 
       expect(config).toEqual({ token: "t" });
     });
@@ -84,32 +86,35 @@ describe("createTestHarness invocation company scope", () => {
       let error: unknown;
 
       harness.ctx.jobs.register("sweep", async () => {
-        try {
-          await harness.ctx.config.get(COMPANY_B);
-        } catch (err) {
-          error = err;
-        }
+        await harness.withCompanyScope(COMPANY_A, async () => {
+          try {
+            await harness.ctx.config.get(COMPANY_B);
+          } catch (err) {
+            error = err;
+          }
+        });
       });
 
-      await harness.runJob("sweep", { companyId: COMPANY_A });
+      await harness.runJob("sweep");
 
       expect((error as Error).message).toMatch(crossCompany(COMPANY_B, COMPANY_A));
     });
 
-    it("puts the company on the job context the handler receives", async () => {
+    it("refuses to fake a job company the scheduler cannot dispatch", async () => {
+      // Both dispatch paths in `plugin-job-scheduler.ts` call `runJob` with
+      // `{ job }` and no company, and `deriveInvocationScope` has no `runJob`
+      // branch. A harness that minted a scope here would authorize a call the
+      // real host refuses — the exact over-permissive fake this enforcement
+      // exists to remove.
       const harness = createTestHarness({ manifest });
-      let seen: unknown;
+      harness.ctx.jobs.register("sweep", async () => {});
 
-      harness.ctx.jobs.register("sweep", async (job) => {
-        seen = (job as { companyId?: unknown }).companyId;
-      });
-
-      await harness.runJob("sweep", { companyId: COMPANY_A });
-
-      expect(seen).toBe(COMPANY_A);
+      await expect(
+        (harness.runJob as (k: string, p: unknown) => Promise<void>)("sweep", { companyId: COMPANY_A }),
+      ).rejects.toThrow(/cannot take a companyId/);
     });
 
-    it("does not leak an outer scope into a nested instance-scoped job run", async () => {
+    it("does not leak an outer scope into a nested job run", async () => {
       const harness = createTestHarness({ manifest });
       let error: unknown;
 
@@ -121,10 +126,12 @@ describe("createTestHarness invocation company scope", () => {
         }
       });
       harness.ctx.jobs.register("outer", async () => {
-        await harness.runJob("inner");
+        await harness.withCompanyScope(COMPANY_A, async () => {
+          await harness.runJob("inner");
+        });
       });
 
-      await harness.runJob("outer", { companyId: COMPANY_A });
+      await harness.runJob("outer");
 
       expect((error as Error).message).toMatch(NO_SCOPE);
     });
@@ -223,17 +230,19 @@ describe("createTestHarness invocation company scope", () => {
       let error: unknown;
 
       harness.ctx.jobs.register("sweep", async () => {
-        try {
-          await harness.ctx.state.set(
-            { scopeKind: "company", scopeId: COMPANY_B, stateKey: "k" },
-            1,
-          );
-        } catch (err) {
-          error = err;
-        }
+        await harness.withCompanyScope(COMPANY_A, async () => {
+          try {
+            await harness.ctx.state.set(
+              { scopeKind: "company", scopeId: COMPANY_B, stateKey: "k" },
+              1,
+            );
+          } catch (err) {
+            error = err;
+          }
+        });
       });
 
-      await harness.runJob("sweep", { companyId: COMPANY_A });
+      await harness.runJob("sweep");
 
       expect((error as Error).message).toMatch(crossCompany(COMPANY_B, COMPANY_A));
     });

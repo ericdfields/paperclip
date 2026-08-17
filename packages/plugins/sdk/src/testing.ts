@@ -145,15 +145,19 @@ export interface TestHarness {
   /**
    * Execute a previously-registered scheduled job handler.
    *
-   * `companyId` sets the invocation company scope for the run, the way a
-   * company-scoped job declaration does in production. A job run without one is
-   * instance-scoped and every company-scoped `ctx` call inside it is refused,
-   * which is exactly what the host does.
+   * A job run carries **no** company scope, so every company-scoped `ctx` call
+   * inside the handler is refused. That is not a harness limitation: both
+   * dispatch paths in `plugin-job-scheduler.ts` call `runJob` with `{ job }`
+   * and no company, `deriveInvocationScope` has no `runJob` branch, and the
+   * host therefore refuses those calls in production too.
+   *
+   * Passing a `companyId` here throws rather than minting a scope the scheduler
+   * cannot mint — a harness that authorized one would be exactly the kind of
+   * over-permissive fake this enforcement exists to remove. To test a handler
+   * for the day the host does dispatch jobs per company, wrap the body in
+   * `withCompanyScope`.
    */
-  runJob(
-    jobKey: string,
-    partial?: Partial<PluginJobContext> & { companyId?: string | null },
-  ): Promise<void>;
+  runJob(jobKey: string, partial?: Partial<PluginJobContext>): Promise<void>;
   /** Invoke a `ctx.data.register(...)` handler by key. */
   getData<T = unknown>(key: string, params?: Record<string, unknown>): Promise<T>;
   /** Invoke a `ctx.actions.register(...)` handler by key. */
@@ -2803,19 +2807,25 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     async runJob(jobKey, partial = {}) {
       const handler = jobs.get(jobKey);
       if (!handler) throw new Error(`No job handler registered for '${jobKey}'`);
-      // A job run is company-scoped only when the job declaration is. Without a
-      // company the run is instance-scoped and every company-scoped `ctx` call
-      // inside it is refused — the same as a job the host dispatched with no
-      // company on its context.
-      const companyId = stringOrNull((partial as { companyId?: unknown }).companyId);
-      await withInvocationScope(companyId, async () => {
+      // A job run gets no company scope, because the scheduler dispatches
+      // `runJob` with `{ job }` and no company (`plugin-job-scheduler.ts`), and
+      // `deriveInvocationScope` has no `runJob` branch. Refuse to fake one:
+      // authorizing a scope the host cannot mint is the over-permissive fake
+      // this enforcement exists to remove.
+      if (stringOrNull((partial as { companyId?: unknown }).companyId)) {
+        throw new Error(
+          "runJob() cannot take a companyId: the host dispatches scheduled jobs with no company scope, "
+          + "so a company-scoped ctx call inside a job handler is refused in production. "
+          + "Wrap the handler body in harness.withCompanyScope(companyId, ...) to test the scoped path.",
+        );
+      }
+      await withInvocationScope(null, async () => {
         await handler({
           jobKey,
           runId: partial.runId ?? randomUUID(),
           trigger: partial.trigger ?? "manual",
           scheduledAt: partial.scheduledAt ?? new Date().toISOString(),
-          ...(companyId ? { companyId } : {}),
-        } as PluginJobContext);
+        });
       });
     },
     async getData<T = unknown>(key: string, params: Record<string, unknown> = {}) {
