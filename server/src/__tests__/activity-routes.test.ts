@@ -310,6 +310,18 @@ describe.sequential("activity routes", () => {
     ["2026/08/10", "host-specific format, no zone"],
     ["2026-08-10T00:00:00", "ISO shape but no zone, so locale-dependent"],
     ["1786060800000", "epoch millis, not ISO-8601"],
+    // `new Date()` rolls these forward rather than failing — "2026-02-31"
+    // becomes March 3 — so a shape-only check would accept a window the caller
+    // never asked for. The date-time forms matter too: Zod's `.datetime()`
+    // validates format, not calendar validity.
+    ["2026-02-31", "ISO shape, impossible day"],
+    ["2026-02-31T00:00:00Z", "impossible day in a date-time"],
+    ["2026-02-31T00:00:00+05:00", "impossible day with an offset"],
+    ["2027-02-29", "Feb 29 in a non-leap year"],
+    ["2026-13-01", "month 13"],
+    ["2026-04-31", "April has 30 days"],
+    ["2026-00-10", "month 0"],
+    ["2026-08-00", "day 0"],
   ])("rejects since=%s (%s) instead of silently ignoring it", async (raw) => {
     mockActivityService.list.mockResolvedValue([]);
 
@@ -320,6 +332,25 @@ describe.sequential("activity routes", () => {
 
     expect(res.status).toBe(400);
     expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  // The guard rejects impossible days, so prove it does not also reject real
+  // ones — Feb 29 in a leap year is the case a naive 28-day rule breaks.
+  it.each([
+    ["2028-02-29", new Date("2028-02-29T00:00:00.000Z")],
+    ["2026-01-31", new Date("2026-01-31T00:00:00.000Z")],
+    ["2028-02-29T06:30:00Z", new Date("2028-02-29T06:30:00.000Z")],
+    ["2026-08-10T00:00:00+05:00", new Date("2026-08-09T19:00:00.000Z")],
+  ])("accepts the real date %s", async (raw, expected) => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/companies/company-1/activity?since=${encodeURIComponent(raw)}`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(expect.objectContaining({ since: expected }));
   });
 
   it("widens a bare date bound to cover that whole UTC day", async () => {

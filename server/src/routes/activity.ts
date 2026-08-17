@@ -114,14 +114,35 @@ const createActivitySchema = z.object({
 // full days a reader expects.
 const isoDateOnly = /^\d{4}-\d{2}-\d{2}$/;
 const isoDateTime = z.string().datetime({ offset: true });
+const calendarDate = /^(\d{4})-(\d{2})-(\d{2})/;
+
+// Both checks above validate shape, not whether the day exists, and
+// `new Date()` rolls an impossible date forward — "2026-02-31" becomes March 3.
+// A rolled-over bound reads as valid and quietly selects a different window
+// than the caller asked for, so verify the civil date itself. This is
+// deliberately independent of any UTC offset on the string: "2026-02-31" is not
+// a date in any zone.
+function hasRealCalendarDate(value: string) {
+  const match = calendarDate.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return false;
+  // Day 0 of the following month is the last day of this one, so this stays
+  // correct for February in a leap year without a special case.
+  return day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
 
 function isoBound(edge: "start" | "end") {
   const dayEdge = edge === "start" ? "T00:00:00.000Z" : "T23:59:59.999Z";
   return z
     .string()
-    .refine((value) => isoDateOnly.test(value) || isoDateTime.safeParse(value).success, {
-      message: "Expected an ISO-8601 date (YYYY-MM-DD) or date-time (YYYY-MM-DDTHH:mm:ssZ)",
-    })
+    .refine(
+      (value) =>
+        (isoDateOnly.test(value) || isoDateTime.safeParse(value).success) && hasRealCalendarDate(value),
+      { message: "Expected an ISO-8601 date (YYYY-MM-DD) or date-time (YYYY-MM-DDTHH:mm:ssZ)" },
+    )
     .transform((value) => new Date(isoDateOnly.test(value) ? `${value}${dayEdge}` : value))
     .optional();
 }

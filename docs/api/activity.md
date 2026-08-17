@@ -29,6 +29,10 @@ so `?since=2026-08-10&until=2026-08-16` returns those seven full days. Any
 other format returns `400` rather than being ignored — the endpoint will not
 silently widen a bounded query back to "everything".
 
+A date that does not exist on the calendar, such as `2026-02-31` or
+`2027-02-29`, also returns `400`. It is not rolled forward to the next real
+day, because that would answer a different question than the one asked.
+
 Records come back newest-first, ordered by `createdAt` then `id`. The `id`
 tiebreaker makes a given `(limit, offset)` pair address a stable row, so
 paging through a window will not skip or repeat records when several share a
