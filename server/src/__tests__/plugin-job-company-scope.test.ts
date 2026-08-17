@@ -381,18 +381,19 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
     expect([...byCompany.values()].filter((status) => status === "succeeded")).toHaveLength(1);
   });
 
-  it("serves every company across ticks when the fan-out is wider than the concurrency cap", async () => {
+  it("finishes a pass wider than the concurrency cap across occurrences, with no company served twice first", async () => {
     const pluginId = await seedPlugin();
     const seeded: string[] = [];
     for (let i = 0; i < 5; i += 1) seeded.push(await seedCompany(`company ${i}`));
     const jobId = await seedDueJob(pluginId, "company");
 
-    // The fan-out set is deterministically ordered, so without a resume cursor
-    // the same two companies would be admitted on every tick and the other
-    // three would never run — starvation, not lateness.
+    // 5 companies, cap 2. The fan-out set is deterministically ordered, so
+    // without carrying the remainder forward the same two companies would be
+    // admitted on every occurrence and the other three would never run at all
+    // — starvation, not lateness.
     const { scheduler, captured } = createHarness({ maxConcurrentJobs: 2 });
 
-    // Group by tick. The runs admitted within one tick are dispatched
+    // Group by occurrence. Runs admitted within one tick are dispatched
     // concurrently, so their arrival order is not deterministic — only the set
     // per tick is.
     const perTick: string[][] = [];
@@ -406,18 +407,61 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
       perTick.push(captured.slice(before).map((job) => job.companyId as string));
     }
 
-    // The starvation guarantee: three ticks at two per tick reach all five.
-    const served = new Set(captured.map((job) => job.companyId));
-    expect([...served].sort()).toEqual([...seeded].sort());
+    // ceil(5 / 2) = 3 occurrences to complete one pass: 2, 2, then the last 1.
+    expect(perTick.map((tick) => tick.length)).toEqual([2, 2, 1]);
 
-    // Each tick honors the cap exactly, and the cursor advances rather than
-    // replaying — the first two ticks must cover four distinct companies.
-    expect(perTick.map((tick) => tick.length)).toEqual([2, 2, 2]);
-    expect(new Set([...perTick[0]!, ...perTick[1]!]).size).toBe(4);
+    // Every company served exactly once. No company gets a second run while
+    // another is still waiting for its first.
+    expect(captured).toHaveLength(5);
+    expect([...new Set(captured.map((job) => job.companyId))].sort()).toEqual(
+      [...seeded].sort(),
+    );
 
     const runs = await runsForJob(jobId);
-    expect(runs).toHaveLength(6);
+    expect(runs).toHaveLength(5);
     expect(runs.every((run) => run.companyId !== null)).toBe(true);
+
+    // The pass is complete, so the next occurrence starts a fresh full one.
+    await db
+      .update(pluginJobs)
+      .set({ nextRunAt: new Date(Date.now() - 60_000) })
+      .where(eq(pluginJobs.id, jobId));
+    await scheduler.tick();
+    expect(captured).toHaveLength(7);
+  });
+
+  it("drops a company from a carried-forward pass once it disables the plugin", async () => {
+    const pluginId = await seedPlugin();
+    const seeded: string[] = [];
+    for (let i = 0; i < 4; i += 1) seeded.push(await seedCompany(`company ${i}`));
+    const jobId = await seedDueJob(pluginId, "company");
+
+    const { scheduler, captured } = createHarness({ maxConcurrentJobs: 2 });
+    await scheduler.tick();
+    expect(captured).toHaveLength(2);
+
+    // Disable the plugin for both companies still owed a run. The carried
+    // remainder must honor that rather than replay a stale membership list.
+    const owed = seeded.filter(
+      (companyId) => !captured.some((job) => job.companyId === companyId),
+    );
+    expect(owed).toHaveLength(2);
+    await db.insert(pluginCompanySettings).values(
+      owed.map((companyId) => ({ pluginId, companyId, enabled: false })),
+    );
+
+    await db
+      .update(pluginJobs)
+      .set({ nextRunAt: new Date(Date.now() - 60_000) })
+      .where(eq(pluginJobs.id, jobId));
+    await scheduler.tick();
+
+    // The remainder emptied, so a fresh pass ran over the two that remain
+    // enabled — and neither disabled company was ever dispatched.
+    expect(captured).toHaveLength(4);
+    for (const companyId of owed) {
+      expect(captured.some((job) => job.companyId === companyId)).toBe(false);
+    }
   });
 
   // -------------------------------------------------------------------------
