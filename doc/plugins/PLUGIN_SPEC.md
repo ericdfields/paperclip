@@ -988,7 +988,7 @@ A job declaration carries an optional `scope`, `"instance"` (the default) or `"c
 
 | | `scope: "instance"` | `scope: "company"` |
 | --- | --- | --- |
-| Runs per tick | one | one per company the plugin is enabled for |
+| Runs per occurrence | one | one per company the plugin is enabled for, subject to the concurrency cap (§17.2) |
 | `job.companyId` in the handler | `null` | that company's id |
 | Company-scoped host calls | **refused** | authorized for that company |
 
@@ -997,6 +997,30 @@ A job declaration carries an optional `scope`, `"instance"` (the default) or `"c
 A company is "enabled" for a plugin when the company is `active` and has no `plugin_company_settings` row disabling the plugin (absence of a row means enabled). A company-scoped job on an instance with no such companies dispatches nothing, which is not an error.
 
 Job *definitions* stay plugin-global — `plugin_jobs` has no company column, one row per `(plugin, job_key)`. Only runs are scoped: `plugin_job_runs.company_id` records the company a run fired for, and is `NULL` for an instance-scoped run.
+
+### 17.2 Fan-out under the concurrency cap
+
+`maxConcurrentJobs` is a **global** ceiling across every plugin job on the instance, so a
+company-scoped job whose enabled-company count exceeds the capacity free at tick time cannot
+serve all of its companies in one occurrence. This is a capacity limit, not a scheduling
+choice, and the contract is written so a plugin author can reason about it:
+
+- The fan-out is ordered **least-recently-run first**, computed from `plugin_job_runs` — durable
+  state, not scheduler memory, so it survives a restart mid-pass.
+- A *pass* over N companies therefore completes in `ceil(N / free capacity)` occurrences, and
+  **no company is served a second time before every company has been served once**.
+- The schedule pointer belongs to the job row and advances once per occurrence. Under
+  saturation the effective per-company cadence is the declared cron interval multiplied by the
+  number of occurrences a pass takes — a company-scoped job at `*/5` with a pass spanning three
+  occurrences reaches each company every fifteen minutes, not every five.
+- Deferral is logged at `warn` with the deferred count and the company the next occurrence
+  resumes from. It is a visible throttle, never a silent drop.
+
+The host deliberately does not drain a wide fan-out inside a single tick: doing so would let one
+plugin's fan-out hold the global cap and stall every other plugin's due jobs, and a handler that
+hangs would hold the job's schedule pointer open indefinitely. A job that needs a hard
+per-occurrence guarantee across many companies should be declared at an interval its instance
+has the capacity to satisfy.
 
 ## 18. Webhooks
 
