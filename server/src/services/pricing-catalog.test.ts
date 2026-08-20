@@ -29,4 +29,23 @@ describe("pricing catalog", () => {
     expect(classifyCost({ provider: "openai", model: "gpt-4o", inputTokens: 10, cachedInputTokens: 0, outputTokens: 10, costCents: 0, billingType: "subscription_included", costStatus: "unpriced" }))
       .toMatchObject({ costStatus: "unpriced", costCents: 0 });
   });
+
+  it("prefers a positive provider cost and leaves unknown zero-cost usage unpriced", () => {
+    expect(classifyCost({
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      outputTokens: 1_000_000,
+      costCents: 777,
+    })).toMatchObject({ costStatus: "reported", costCents: 777, pricingCatalogVersion: null });
+    expect(classifyCost({
+      provider: "unknown",
+      model: "mystery",
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      outputTokens: 1,
+      costCents: 0,
+    })).toMatchObject({ costStatus: "unpriced", costCents: 0, pricingCatalogVersion: null });
+  });
 });
