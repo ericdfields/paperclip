@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -10,6 +10,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  heartbeatRuns,
   instanceSettings,
   issues,
   projects,
@@ -18,6 +19,7 @@ import {
   ENVIRONMENT_DRIVERS,
   ENVIRONMENT_LEASE_CLEANUP_STATUSES,
   ENVIRONMENT_LEASE_POLICIES,
+  DEFAULT_EPHEMERAL_LEASE_TTL_MS,
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
   type CreateEnvironment,
@@ -1342,7 +1344,11 @@ export function environmentService(db: Db) {
         providerLeaseId: input.providerLeaseId ?? null,
         acquiredAt: now,
         lastUsedAt: now,
-        expiresAt: input.expiresAt ?? null,
+        expiresAt: input.expiresAt ?? (
+          (input.leasePolicy ?? "ephemeral") === "ephemeral"
+            ? new Date(now.getTime() + DEFAULT_EPHEMERAL_LEASE_TTL_MS)
+            : null
+        ),
         releasedAt: null,
         failureReason: null,
         cleanupStatus: null,
@@ -1536,6 +1542,52 @@ export function environmentService(db: Db) {
         )
         .returning();
       return rows.map(toEnvironmentLease);
+    },
+
+    /**
+     * Reconcile leases that cannot still belong to live work. This is deliberately
+     * database-only: provider teardown remains owned by the runtime cleanup path,
+     * while stale local/ephemeral rows must not block the next dispatch forever.
+     */
+    reconcileOrphanedLeases: async (now = new Date()) => {
+      const ttlCutoff = new Date(now.getTime() - DEFAULT_EPHEMERAL_LEASE_TTL_MS);
+      const rows = await db
+        .select({
+          lease: environmentLeases,
+          issueStatus: issues.status,
+          runStatus: heartbeatRuns.status,
+        })
+        .from(environmentLeases)
+        .leftJoin(issues, eq(issues.id, environmentLeases.issueId))
+        .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+        .where(and(
+          eq(environmentLeases.status, "active"),
+          or(
+            lt(environmentLeases.expiresAt, now),
+            and(eq(environmentLeases.leasePolicy, "ephemeral"), isNull(environmentLeases.expiresAt), lt(environmentLeases.acquiredAt, ttlCutoff)),
+            and(isNull(environmentLeases.issueId), isNull(environmentLeases.heartbeatRunId), lt(environmentLeases.acquiredAt, ttlCutoff)),
+          ),
+        ));
+      let expired = 0;
+      let released = 0;
+      for (const row of rows) {
+        const terminalIssue = row.issueStatus === "done" || row.issueStatus === "cancelled";
+        const deadRun = row.lease.heartbeatRunId != null && (!row.runStatus || ["succeeded", "failed", "cancelled", "timed_out"].includes(row.runStatus));
+        const status = terminalIssue || deadRun ? "released" : "expired";
+        const reason = terminalIssue ? `issue_terminal_${row.issueStatus}` : deadRun ? `heartbeat_run_${row.runStatus ?? "missing"}` : "lease_ttl_expired";
+        const updated = await db.update(environmentLeases).set({
+          status,
+          releasedAt: now,
+          expiresAt: row.lease.expiresAt ?? now,
+          failureReason: row.lease.failureReason ?? reason,
+          updatedAt: now,
+          lastUsedAt: now,
+        }).where(and(eq(environmentLeases.id, row.lease.id), eq(environmentLeases.status, "active"))).returning({ id: environmentLeases.id });
+        if (updated.length === 0) continue;
+        if (status === "released") released += 1;
+        else expired += 1;
+      }
+      return { scanned: rows.length, released, expired };
     },
   };
 }
