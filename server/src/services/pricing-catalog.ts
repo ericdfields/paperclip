@@ -103,18 +103,23 @@ export function classifyCost(input: {
  *   would silently restate spend that was recorded under a stated version.
  * - A row billed as `subscription_included` costs zero by contract. Its zero is
  *   a fact, not a gap.
- * - A row that carries a cost carries a number the provider reported. Replacing
- *   it with an estimate corrupts stored spend and can move a budget incident or
- *   a hard stop.
+ * - A row that carries a cost carries a number the provider reported.
+ * - A row that states `reported` carries a number the provider reported even
+ *   when that number is zero. `resolveLedgerCostStatus` writes `unpriced` when
+ *   the provider named no cost and tokens were used, and `reported` in every
+ *   other case, so a `reported` zero is a charge that rounded to zero at
+ *   integer cents, not an absent price. Restating one would move stored spend
+ *   for a charge the provider did name.
  *
- * What is left is a row with no catalog version and no cost, which is what the
- * repair exists for. The first version of this selected on `costStatus` or a
- * null version, which took in every pre-migration row, including the priced
- * ones.
+ * What is left is a row that states it was never priced, carries no cost, and
+ * names no catalog version, which is what the repair exists for. The first
+ * version of this selected on `unpriced OR no version`, and every row written
+ * before the migration has no version, so it took in the priced rows too.
  */
 const repairableRowCondition = (companyId: string) => and(
   eq(costEvents.companyId, companyId),
   isNull(costEvents.pricingCatalogVersion),
+  eq(costEvents.costStatus, "unpriced"),
   eq(costEvents.costCents, 0),
   ne(costEvents.billingType, "subscription_included"),
 );

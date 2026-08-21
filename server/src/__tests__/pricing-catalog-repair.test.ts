@@ -76,7 +76,7 @@ describeEmbeddedPostgres("repairHistoricalPricing", () => {
       provider: "openai",
       biller: "openai",
       billingType: "api",
-      costStatus: "reported",
+      costStatus: "unpriced",
       pricingCatalogVersion: null,
       model: "gpt-4o",
       inputTokens: 1_000_000,
@@ -90,7 +90,22 @@ describeEmbeddedPostgres("repairHistoricalPricing", () => {
     return id;
   }
 
-  it("repairs a row that has no cost and no catalog version", async () => {
+  it("leaves a reported zero alone, because a sub-cent charge rounds to zero", async () => {
+    const { companyId, agentId } = await seedCompany();
+    // resolveLedgerCostStatus writes `reported` when the provider named a cost,
+    // so a reported zero is a charge that rounded down, not an absent price.
+    const id = await seedEvent(companyId, agentId, { costStatus: "reported", costCents: 0 });
+
+    const result = await repairHistoricalPricing(db, { companyId, apply: true });
+    expect(result).toMatchObject({ scanned: 0, confidentlyMatched: 0, updatedEventIds: [] });
+
+    const [row] = await db.select().from(costEvents).where(eq(costEvents.id, id));
+    expect(row.costCents).toBe(0);
+    expect(row.costStatus).toBe("reported");
+    expect(row.pricingCatalogVersion).toBeNull();
+  });
+
+  it("repairs a row that was never priced, has no cost, and names no catalog version", async () => {
     const { companyId, agentId } = await seedCompany();
     const id = await seedEvent(companyId, agentId, {});
 
