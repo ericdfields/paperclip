@@ -7,8 +7,10 @@ import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
+  isExecutionWorkspaceIsolationDrift,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
+  issueExecutionWorkspaceModeForPersistence,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   ManagedSandboxUnavailableError,
@@ -44,6 +46,90 @@ describe("execution workspace policy helpers", () => {
         legacyUseProjectWorkspace: false,
       }),
     ).toBe("isolated_workspace");
+  });
+
+  it("lets a project forbid per-issue mode overrides with allowIssueOverride: false", () => {
+    // The mode an inherited run wrote into the issue must not outrank a project that
+    // declared its default mandatory — this is the escape hatch for issues already
+    // carrying a manufactured `shared_workspace` pin.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace", allowIssueOverride: false },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace", allowIssueOverride: true },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("shared_workspace");
+    // Absent keeps the historical issue-wins precedence.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("shared_workspace");
+  });
+
+  it("ignores allowIssueOverride on a disabled project policy", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: false, defaultMode: "isolated_workspace", allowIssueOverride: false },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
+  it("records a realized mode on the issue only when the issue chose one itself", () => {
+    // An inheriting issue must stay on `inherit`; writing the realized mode here is what
+    // manufactured the `shared_workspace` pins that made the project default unreachable.
+    for (const priorIssueMode of ["inherit", "reuse_existing", null, undefined] as const) {
+      expect(
+        issueExecutionWorkspaceModeForPersistence({
+          priorIssueMode,
+          persistedWorkspaceMode: "shared_workspace",
+        }),
+      ).toBe("inherit");
+    }
+    // An issue that did choose a mode keeps an explicit one, refreshed to what actually
+    // got realized — so a pinned issue heals to `isolated_workspace` after one run.
+    expect(
+      issueExecutionWorkspaceModeForPersistence({
+        priorIssueMode: "shared_workspace",
+        persistedWorkspaceMode: "isolated_workspace",
+      }),
+    ).toBe("isolated_workspace");
+    expect(
+      issueExecutionWorkspaceModeForPersistence({
+        priorIssueMode: "isolated_workspace",
+        persistedWorkspaceMode: "adapter_managed",
+      }),
+    ).toBe("agent_default");
+  });
+
+  it("detects isolation drift only when the bound workspace cannot be the issue's own tree", () => {
+    for (const existingWorkspaceMode of ["shared_workspace", "adapter_managed", null, undefined]) {
+      expect(
+        isExecutionWorkspaceIsolationDrift({ resolvedMode: "isolated_workspace", existingWorkspaceMode }),
+      ).toBe(true);
+    }
+    for (const existingWorkspaceMode of ["isolated_workspace", "operator_branch", "cloud_sandbox"]) {
+      expect(
+        isExecutionWorkspaceIsolationDrift({ resolvedMode: "operator_branch", existingWorkspaceMode }),
+      ).toBe(false);
+    }
+    // Modes that never promise a private tree cannot drift into one.
+    for (const resolvedMode of ["shared_workspace", "agent_default"] as const) {
+      expect(
+        isExecutionWorkspaceIsolationDrift({ resolvedMode, existingWorkspaceMode: "shared_workspace" }),
+      ).toBe(false);
+    }
   });
 
   it("resolves shared-workspace concurrency from issue override, project policy, then auto", () => {

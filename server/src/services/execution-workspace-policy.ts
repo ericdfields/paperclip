@@ -327,13 +327,69 @@ export function issueExecutionWorkspaceModeForPersistedWorkspace(
   return "shared_workspace";
 }
 
+/**
+ * The mode to record on an issue after a run realizes a workspace for it.
+ *
+ * Recording the realized mode unconditionally is what pinned inherited issues to a shared
+ * tree: an issue that never chose a mode got an explicit `shared_workspace` written into its
+ * settings on its first run, and an explicit issue mode outranks the project default from
+ * then on — so changing the project default could never reach it again. Only issues that
+ * actually chose a mode keep an explicit one; inheriting issues stay on `inherit` so the
+ * project default keeps applying. Workspace continuity is carried by the issue's
+ * `executionWorkspaceId` + `reuse_existing` preference, not by this field.
+ */
+export function issueExecutionWorkspaceModeForPersistence(input: {
+  priorIssueMode: IssueExecutionWorkspaceSettings["mode"] | null | undefined;
+  persistedWorkspaceMode: string | null | undefined;
+}): IssueExecutionWorkspaceSettings["mode"] {
+  const priorIssueMode = input.priorIssueMode;
+  const issueChoseItsOwnMode =
+    Boolean(priorIssueMode) && priorIssueMode !== "inherit" && priorIssueMode !== "reuse_existing";
+  return issueChoseItsOwnMode
+    ? issueExecutionWorkspaceModeForPersistedWorkspace(input.persistedWorkspaceMode)
+    : "inherit";
+}
+
+/**
+ * Whether a persisted execution workspace gives its issue a tree no other issue runs in.
+ * `shared_workspace` and `adapter_managed` (the agent's own home cwd) are shared by
+ * construction, and an unrecorded mode cannot be proven private — only a worktree, an
+ * operator branch, or a per-run cloud sandbox is genuinely the issue's own.
+ */
+export function persistedExecutionWorkspaceIsolatesTree(mode: string | null | undefined): boolean {
+  return mode === "isolated_workspace" || mode === "operator_branch" || mode === "cloud_sandbox";
+}
+
+/**
+ * True when the freshly resolved mode promises the issue a tree of its own but the workspace
+ * it is bound to is a shared one. Reusing that binding would run the issue in the shared tree
+ * while every downstream record claims it is isolated, so the reuse path refuses and the
+ * create path realizes the mode that was actually resolved.
+ */
+export function isExecutionWorkspaceIsolationDrift(input: {
+  resolvedMode: ParsedExecutionWorkspaceMode;
+  existingWorkspaceMode: string | null | undefined;
+}): boolean {
+  if (input.resolvedMode !== "isolated_workspace" && input.resolvedMode !== "operator_branch") {
+    return false;
+  }
+  return !persistedExecutionWorkspaceIsolatesTree(input.existingWorkspaceMode);
+}
+
 export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
 }): ParsedExecutionWorkspaceMode {
   const issueMode = input.issueSettings?.mode;
-  if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
+  // `allowIssueOverride: false` is the project declaring its default mode mandatory. It was
+  // parsed, persisted, and round-tripped by the settings UI while no resolver read it, so a
+  // per-issue mode outranked the project default even when the project had forbidden exactly
+  // that. Absent (or `true`) keeps the historical issue-wins precedence.
+  const issueOverrideAllowed = input.projectPolicy?.enabled
+    ? input.projectPolicy.allowIssueOverride !== false
+    : true;
+  if (issueOverrideAllowed && issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
     return issueMode;
   }
   if (input.projectPolicy?.enabled) {
