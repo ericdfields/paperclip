@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -22,6 +22,8 @@ import {
   DEFAULT_EPHEMERAL_LEASE_TTL_MS,
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
+  type HeartbeatRunTerminalStatus,
   type CreateEnvironment,
   type Environment,
   type EnvironmentDeleteBlastRadius,
@@ -55,6 +57,9 @@ const KUBERNETES_PROVIDER_KEY = "kubernetes";
 /** Metadata marker for the company's managed-by-config Kubernetes sandbox environment. */
 const KUBERNETES_MANAGED_MARKER = "managedKubernetesSandbox";
 const ACTIVE_CUSTOM_IMAGE_SETUP_STATUSES = ["starting", "waiting_for_user", "capturing"] as const;
+/** An issue in one of these statuses has no more work, so it holds no lease. */
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
+type TerminalIssueStatus = (typeof TERMINAL_ISSUE_STATUSES)[number];
 
 /**
  * Configuration accepted by `ensureKubernetesEnvironment`. Mirrors the keys of
@@ -1344,11 +1349,12 @@ export function environmentService(db: Db) {
         providerLeaseId: input.providerLeaseId ?? null,
         acquiredAt: now,
         lastUsedAt: now,
-        expiresAt: input.expiresAt ?? (
-          (input.leasePolicy ?? "ephemeral") === "ephemeral"
-            ? new Date(now.getTime() + DEFAULT_EPHEMERAL_LEASE_TTL_MS)
-            : null
-        ),
+        // `expiresAt` records an expiry the provider attested. Do not put a
+        // local deadline here: a reader cannot then tell an enforced expiry
+        // from a guess. An ephemeral lease with no attested expiry is bounded
+        // instead by `reconcileOrphanedLeases`, which measures the default TTL
+        // from `acquiredAt`.
+        expiresAt: input.expiresAt ?? null,
         releasedAt: null,
         failureReason: null,
         cleanupStatus: null,
@@ -1551,11 +1557,18 @@ export function environmentService(db: Db) {
      */
     reconcileOrphanedLeases: async (now = new Date()) => {
       const ttlCutoff = new Date(now.getTime() - DEFAULT_EPHEMERAL_LEASE_TTL_MS);
+      // The lease's run has stopped, or its row is gone. A missing row is the
+      // same condition: nothing can still be using the lease.
+      const runIsOver = or(
+        isNull(heartbeatRuns.id),
+        inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+      );
       const rows = await db
         .select({
           lease: environmentLeases,
           issueStatus: issues.status,
           runStatus: heartbeatRuns.status,
+          runId: heartbeatRuns.id,
         })
         .from(environmentLeases)
         .leftJoin(issues, eq(issues.id, environmentLeases.issueId))
@@ -1566,19 +1579,35 @@ export function environmentService(db: Db) {
             lt(environmentLeases.expiresAt, now),
             and(eq(environmentLeases.leasePolicy, "ephemeral"), isNull(environmentLeases.expiresAt), lt(environmentLeases.acquiredAt, ttlCutoff)),
             and(isNull(environmentLeases.issueId), isNull(environmentLeases.heartbeatRunId), lt(environmentLeases.acquiredAt, ttlCutoff)),
+            // An ephemeral lease whose run has stopped, or whose issue reached a
+            // terminal status with no live run, cannot belong to live work. Take
+            // it back now instead of holding the environment until the TTL runs
+            // out. The clause stays on ephemeral leases: the reuse policies keep
+            // a lease across runs on purpose, and `retain_on_failure` keeps one
+            // after a failure on purpose.
+            and(
+              eq(environmentLeases.leasePolicy, "ephemeral"),
+              or(
+                and(isNotNull(environmentLeases.heartbeatRunId), runIsOver),
+                and(
+                  inArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+                  or(isNull(environmentLeases.heartbeatRunId), runIsOver),
+                ),
+              ),
+            ),
           ),
         ));
       let expired = 0;
       let released = 0;
       for (const row of rows) {
-        const terminalIssue = row.issueStatus === "done" || row.issueStatus === "cancelled";
-        const deadRun = row.lease.heartbeatRunId != null && (!row.runStatus || ["succeeded", "failed", "cancelled", "timed_out"].includes(row.runStatus));
+        const terminalIssue = TERMINAL_ISSUE_STATUSES.includes(row.issueStatus as TerminalIssueStatus);
+        const deadRun = row.lease.heartbeatRunId != null
+          && (row.runId == null || HEARTBEAT_RUN_TERMINAL_STATUSES.includes(row.runStatus as HeartbeatRunTerminalStatus));
         const status = terminalIssue || deadRun ? "released" : "expired";
         const reason = terminalIssue ? `issue_terminal_${row.issueStatus}` : deadRun ? `heartbeat_run_${row.runStatus ?? "missing"}` : "lease_ttl_expired";
         const updated = await db.update(environmentLeases).set({
           status,
           releasedAt: now,
-          expiresAt: row.lease.expiresAt ?? now,
           failureReason: row.lease.failureReason ?? reason,
           updatedAt: now,
           lastUsedAt: now,
@@ -1586,6 +1615,31 @@ export function environmentService(db: Db) {
         if (updated.length === 0) continue;
         if (status === "released") released += 1;
         else expired += 1;
+        // The reconciler is the only actor that ends a lease without a run
+        // behind it, so without this record the transition has no author and no
+        // reason in the activity log.
+        await logActivity(db, {
+          companyId: row.lease.companyId,
+          actorType: "system",
+          actorId: "environment-lease-reconciler",
+          action: status === "released" ? "environment.lease_released" : "environment.lease_expired",
+          entityType: "environment_lease",
+          entityId: row.lease.id,
+          runId: row.lease.heartbeatRunId,
+          issueId: row.lease.issueId,
+          details: {
+            environmentId: row.lease.environmentId,
+            executionWorkspaceId: row.lease.executionWorkspaceId,
+            leasePolicy: row.lease.leasePolicy,
+            provider: row.lease.provider,
+            status,
+            reason,
+            issueStatus: row.issueStatus ?? null,
+            heartbeatRunStatus: row.lease.heartbeatRunId == null ? null : row.runStatus ?? "missing",
+            acquiredAt: row.lease.acquiredAt.toISOString(),
+            expiresAt: row.lease.expiresAt?.toISOString() ?? null,
+          },
+        });
       }
       return { scanned: rows.length, released, expired };
     },

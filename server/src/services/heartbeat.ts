@@ -7,6 +7,7 @@ import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte,
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   MODEL_PROFILE_KEYS,
@@ -434,7 +435,6 @@ const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
