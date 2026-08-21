@@ -1,8 +1,13 @@
-import { and, eq, gte, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, gte, isNull, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, costEvents } from "@paperclipai/db";
 
-/** Bumped only when a catalog entry or alias changes. Runtime pricing lookups are intentionally not used. */
+/**
+ * The version a stored estimate is attributed to. It is bumped when a catalog
+ * entry, an alias, or the arithmetic below changes, because a stamped row has
+ * to stay re-derivable from the version it names. Runtime pricing lookups are
+ * intentionally not used.
+ */
 export const PRICING_CATALOG_VERSION = "2026-08-19.v1";
 
 type Price = { inputCentsPerMillion: number; cachedInputCentsPerMillion?: number; outputCentsPerMillion: number };
@@ -31,12 +36,36 @@ export function normalizePricingIdentifier(value: string | null | undefined): st
     .replace(/\s+/g, "-");
 }
 
+/**
+ * Whether a provider's reported input-token count already contains the cached
+ * input tokens it reports beside it. The two categories are priced separately,
+ * so this decides whether the cached count must be subtracted before the
+ * uncached count is priced. Providers do not agree, and the adapters pass the
+ * provider's own numbers through without normalizing them.
+ *
+ * - Anthropic reports `input_tokens` and `cache_read_input_tokens` as disjoint
+ *   counts. Subtracting one from the other charges cache-heavy events at the
+ *   cached rate for input they were billed for at the full rate.
+ * - OpenAI reports cached tokens as a subset of `input_tokens`.
+ * - Google reports `cachedContentTokenCount` inside `promptTokenCount`.
+ *
+ * A provider that is not listed is treated as inclusive, which is the safer of
+ * the two defaults: it can only over-count cached tokens, never under-count the
+ * spend of a provider whose counts are disjoint.
+ */
+const INPUT_EXCLUDES_CACHED: Record<string, true> = { anthropic: true };
+
 export function resolveCatalogPrice(provider: string, biller: string | null | undefined, model: string) {
-  const providerKey = normalizePricingIdentifier(provider || biller);
   const modelKey = ALIASES[normalizePricingIdentifier(model)] ?? normalizePricingIdentifier(model);
-  const key = `${providerKey}:${modelKey}`;
-  const price = CATALOG[key] ?? CATALOG[`${normalizePricingIdentifier(biller)}:${modelKey}`];
-  return price ? { ...price, key, catalogVersion: PRICING_CATALOG_VERSION } : null;
+  const primaryProvider = normalizePricingIdentifier(provider || biller);
+  const billerProvider = normalizePricingIdentifier(biller);
+  const key = `${primaryProvider}:${modelKey}`;
+  const price = CATALOG[key]
+    ? { price: CATALOG[key], key, providerKey: primaryProvider }
+    : CATALOG[`${billerProvider}:${modelKey}`]
+      ? { price: CATALOG[`${billerProvider}:${modelKey}`], key, providerKey: billerProvider }
+      : null;
+  return price ? { ...price.price, key: price.key, providerKey: price.providerKey, catalogVersion: PRICING_CATALOG_VERSION } : null;
 }
 
 export function catalogCostCents(input: {
@@ -44,7 +73,9 @@ export function catalogCostCents(input: {
 }) {
   const price = resolveCatalogPrice(input.provider, input.biller, input.model);
   if (!price) return null;
-  const uncachedInput = Math.max(0, input.inputTokens - input.cachedInputTokens);
+  const uncachedInput = INPUT_EXCLUDES_CACHED[price.providerKey]
+    ? input.inputTokens
+    : Math.max(0, input.inputTokens - input.cachedInputTokens);
   const cents = (uncachedInput * price.inputCentsPerMillion
     + input.cachedInputTokens * (price.cachedInputCentsPerMillion ?? price.inputCentsPerMillion)
     + input.outputTokens * price.outputCentsPerMillion) / 1_000_000;
@@ -61,11 +92,35 @@ export function classifyCost(input: {
   return estimated ? { costStatus: "reported" as const, ...estimated } : { costStatus: "unpriced" as const, pricingCatalogVersion: null, costCents: 0 };
 }
 
+/**
+ * The rows the repair is allowed to write.
+ *
+ * The repair estimates. An estimate may only replace an absence, never a
+ * charge, so the same precedence `classifyCost` applies on the write path
+ * decides eligibility here:
+ *
+ * - A row already attributed to a catalog version is left alone. Re-pricing it
+ *   would silently restate spend that was recorded under a stated version.
+ * - A row billed as `subscription_included` costs zero by contract. Its zero is
+ *   a fact, not a gap.
+ * - A row that carries a cost carries a number the provider reported. Replacing
+ *   it with an estimate corrupts stored spend and can move a budget incident or
+ *   a hard stop.
+ *
+ * What is left is a row with no catalog version and no cost, which is what the
+ * repair exists for. The first version of this selected on `costStatus` or a
+ * null version, which took in every pre-migration row, including the priced
+ * ones.
+ */
+const repairableRowCondition = (companyId: string) => and(
+  eq(costEvents.companyId, companyId),
+  isNull(costEvents.pricingCatalogVersion),
+  eq(costEvents.costCents, 0),
+  ne(costEvents.billingType, "subscription_included"),
+);
+
 export async function repairHistoricalPricing(db: Db, input: { companyId: string; apply: boolean }) {
-  const rows = await db.select().from(costEvents).where(and(
-    eq(costEvents.companyId, input.companyId),
-    or(eq(costEvents.costStatus, "unpriced"), isNull(costEvents.pricingCatalogVersion)),
-  ));
+  const rows = await db.select().from(costEvents).where(repairableRowCondition(input.companyId));
   const matched: string[] = [];
   if (input.apply) {
     await db.transaction(async (tx) => {

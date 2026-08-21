@@ -48,4 +48,45 @@ describe("pricing catalog", () => {
       costCents: 0,
     })).toMatchObject({ costStatus: "unpriced", costCents: 0, pricingCatalogVersion: null });
   });
+
+  it("prices an Anthropic event on disjoint counts and an OpenAI event on an inclusive one", () => {
+    // Anthropic reports input_tokens and cache_read_input_tokens separately, so
+    // 1,000,000 uncached at 300 plus 1,000,000 cached at 30 is 330 cents.
+    expect(catalogCostCents({
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      inputTokens: 1_000_000,
+      cachedInputTokens: 1_000_000,
+      outputTokens: 0,
+    })).toEqual({ costCents: 330, pricingCatalogVersion: PRICING_CATALOG_VERSION });
+
+    // OpenAI reports cached tokens inside input_tokens, so the same figures are
+    // 500,000 uncached at 250 plus 500,000 cached at 125, which is 188 cents.
+    expect(catalogCostCents({
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 1_000_000,
+      cachedInputTokens: 500_000,
+      outputTokens: 0,
+    })).toEqual({ costCents: 188, pricingCatalogVersion: PRICING_CATALOG_VERSION });
+  });
+
+  it("does not let a cached count drive an Anthropic event to the cached rate alone", () => {
+    // A cache-heavy turn, which is the ordinary shape of a long agent run. The
+    // old arithmetic subtracted the cached count from a count that never held
+    // it, priced every input token at the cached rate, and reported 30 cents.
+    const heavy = catalogCostCents({
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      inputTokens: 200_000,
+      cachedInputTokens: 1_000_000,
+      outputTokens: 0,
+    });
+    expect(heavy).toEqual({ costCents: 90, pricingCatalogVersion: PRICING_CATALOG_VERSION });
+  });
+
+  it("resolves the provider that priced the event, including through the biller", () => {
+    expect(resolveCatalogPrice("unknown", "anthropic", "claude-opus-4-1")?.providerKey).toBe("anthropic");
+    expect(resolveCatalogPrice("openai", null, "gpt-5")?.providerKey).toBe("openai");
+  });
 });
