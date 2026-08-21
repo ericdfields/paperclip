@@ -1229,7 +1229,7 @@ export async function startServer(): Promise<StartedServer> {
         // failure in it must not stop hot-restart adoption from running.
         try {
           const leases = await environmentService(db as any).reconcileOrphanedLeases();
-          if (leases.released > 0 || leases.expired > 0) {
+          if (leases.released > 0 || leases.expired > 0 || leases.failed > 0) {
             logger.warn(leases, "startup environment lease reconciliation changed stale lease state");
           }
         } catch (err) {
@@ -1553,7 +1553,7 @@ export async function startServer(): Promise<StartedServer> {
             .then(async () => {
               try {
                 const leases = await environmentService(db as any).reconcileOrphanedLeases();
-                if (leases.released > 0 || leases.expired > 0) {
+                if (leases.released > 0 || leases.expired > 0 || leases.failed > 0) {
                   logger.warn(leases, "periodic environment lease reconciliation changed stale lease state");
                 }
               } catch (err) {

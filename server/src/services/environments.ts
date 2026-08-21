@@ -35,7 +35,7 @@ import {
   type UpdateEnvironment,
 } from "@paperclipai/shared";
 import { conflict, forbidden } from "../errors.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import {
   resourceStatus,
@@ -1599,49 +1599,72 @@ export function environmentService(db: Db) {
         ));
       let expired = 0;
       let released = 0;
+      let failed = 0;
       for (const row of rows) {
         const terminalIssue = TERMINAL_ISSUE_STATUSES.includes(row.issueStatus as TerminalIssueStatus);
         const deadRun = row.lease.heartbeatRunId != null
           && (row.runId == null || HEARTBEAT_RUN_TERMINAL_STATUSES.includes(row.runStatus as HeartbeatRunTerminalStatus));
         const status = terminalIssue || deadRun ? "released" : "expired";
         const reason = terminalIssue ? `issue_terminal_${row.issueStatus}` : deadRun ? `heartbeat_run_${row.runStatus ?? "missing"}` : "lease_ttl_expired";
-        const updated = await db.update(environmentLeases).set({
-          status,
-          releasedAt: now,
-          failureReason: row.lease.failureReason ?? reason,
-          updatedAt: now,
-          lastUsedAt: now,
-        }).where(and(eq(environmentLeases.id, row.lease.id), eq(environmentLeases.status, "active"))).returning({ id: environmentLeases.id });
-        if (updated.length === 0) continue;
+        let applied = false;
+        // Held back until the transaction commits. A publication sent from
+        // inside it would announce a release that a rollback then undoes.
+        const publications: ActivityPublication[] = [];
+        try {
+          // The transition and its record commit together or not at all. Written
+          // apart, a failure between the two leaves a lease released with no
+          // author and no reason, and no later sweep can repair that, because
+          // this query reads active leases only and the row has already left its
+          // reach. A rollback leaves the lease active instead, which costs the
+          // environment one more sweep and stays recoverable.
+          applied = await db.transaction(async (tx) => {
+            const updated = await tx.update(environmentLeases).set({
+              status,
+              releasedAt: now,
+              failureReason: row.lease.failureReason ?? reason,
+              updatedAt: now,
+              lastUsedAt: now,
+            }).where(and(eq(environmentLeases.id, row.lease.id), eq(environmentLeases.status, "active"))).returning({ id: environmentLeases.id });
+            if (updated.length === 0) return false;
+            // The reconciler is the only actor that ends a lease without a run
+            // behind it, so without this record the transition has no author and
+            // no reason in the activity log.
+            await logActivity(tx as unknown as Db, {
+              companyId: row.lease.companyId,
+              actorType: "system",
+              actorId: "environment-lease-reconciler",
+              action: status === "released" ? "environment.lease_released" : "environment.lease_expired",
+              entityType: "environment_lease",
+              entityId: row.lease.id,
+              runId: row.lease.heartbeatRunId,
+              issueId: row.lease.issueId,
+              details: {
+                environmentId: row.lease.environmentId,
+                executionWorkspaceId: row.lease.executionWorkspaceId,
+                leasePolicy: row.lease.leasePolicy,
+                provider: row.lease.provider,
+                status,
+                reason,
+                issueStatus: row.issueStatus ?? null,
+                heartbeatRunStatus: row.lease.heartbeatRunId == null ? null : row.runStatus ?? "missing",
+                acquiredAt: row.lease.acquiredAt.toISOString(),
+                expiresAt: row.lease.expiresAt?.toISOString() ?? null,
+              },
+            }, publications);
+            return true;
+          });
+        } catch {
+          // One lease that cannot be reconciled must not end the sweep for the
+          // rest. The row stays active and the next sweep reads it again.
+          failed += 1;
+          continue;
+        }
+        if (!applied) continue;
+        for (const publication of publications) publishActivity(publication);
         if (status === "released") released += 1;
         else expired += 1;
-        // The reconciler is the only actor that ends a lease without a run
-        // behind it, so without this record the transition has no author and no
-        // reason in the activity log.
-        await logActivity(db, {
-          companyId: row.lease.companyId,
-          actorType: "system",
-          actorId: "environment-lease-reconciler",
-          action: status === "released" ? "environment.lease_released" : "environment.lease_expired",
-          entityType: "environment_lease",
-          entityId: row.lease.id,
-          runId: row.lease.heartbeatRunId,
-          issueId: row.lease.issueId,
-          details: {
-            environmentId: row.lease.environmentId,
-            executionWorkspaceId: row.lease.executionWorkspaceId,
-            leasePolicy: row.lease.leasePolicy,
-            provider: row.lease.provider,
-            status,
-            reason,
-            issueStatus: row.issueStatus ?? null,
-            heartbeatRunStatus: row.lease.heartbeatRunId == null ? null : row.runStatus ?? "missing",
-            acquiredAt: row.lease.acquiredAt.toISOString(),
-            expiresAt: row.lease.expiresAt?.toISOString() ?? null,
-          },
-        });
       }
-      return { scanned: rows.length, released, expired };
+      return { scanned: rows.length, released, expired, failed };
     },
   };
 }
