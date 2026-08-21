@@ -49,6 +49,7 @@ import {
   backfillLegacyToolOAuthTokens,
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
+  environmentService,
   decisionService,
   decisionRetentionService,
   externalObjectService,
@@ -1225,6 +1226,10 @@ export async function startServer(): Promise<StartedServer> {
     } else {
       const startupHeartbeatRecovery = (async () => {
         try {
+          const leases = await environmentService(db as any).reconcileOrphanedLeases();
+          if (leases.released > 0 || leases.expired > 0) {
+            logger.warn(leases, "startup environment lease reconciliation changed stale lease state");
+          }
           const hotRestart = await heartbeat.reconcileHotRestartAdoption();
           if (hotRestart.mode === "reported") {
             logger.info(
@@ -1527,6 +1532,12 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const leases = await environmentService(db as any).reconcileOrphanedLeases();
+              if (leases.released > 0 || leases.expired > 0) {
+                logger.warn(leases, "periodic environment lease reconciliation changed stale lease state");
               }
             })
             .then(async () => {

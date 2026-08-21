@@ -593,6 +593,9 @@ export const ENVIRONMENT_LEASE_POLICIES = [
 ] as const;
 export type EnvironmentLeasePolicy = (typeof ENVIRONMENT_LEASE_POLICIES)[number];
 
+/** Ephemeral leases must always have an upper bound, even if a caller omits one. */
+export const DEFAULT_EPHEMERAL_LEASE_TTL_MS = 6 * 60 * 60 * 1000;
+
 export const ENVIRONMENT_LEASE_CLEANUP_STATUSES = ["pending", "success", "failed"] as const;
 export type EnvironmentLeaseCleanupStatus = (typeof ENVIRONMENT_LEASE_CLEANUP_STATUSES)[number];
 
