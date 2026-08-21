@@ -356,7 +356,7 @@ export function issueExecutionWorkspaceModeForPersistence(input: {
  * construction, and an unrecorded mode cannot be proven private — only a worktree, an
  * operator branch, or a per-run cloud sandbox is genuinely the issue's own.
  */
-export function persistedExecutionWorkspaceIsolatesTree(mode: string | null | undefined): boolean {
+function persistedExecutionWorkspaceIsolatesTree(mode: string | null | undefined): boolean {
   return mode === "isolated_workspace" || mode === "operator_branch" || mode === "cloud_sandbox";
 }
 
