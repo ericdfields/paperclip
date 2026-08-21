@@ -72,15 +72,19 @@ export function auditRoster(manifest: RosterManifestEntry[], live: LiveRosterEnt
   for (const entry of manifest) {
     const byName = liveByName.get(normalizeName(entry.name)) ?? [];
     const match = entry.id ? liveById.get(entry.id) : byName.length === 1 ? byName[0] : undefined;
-    if (!match) {
+    // One live agent answers for one manifest entry. A second entry that claims
+    // an agent an earlier entry already claimed is a duplicate listing, which is
+    // drift in its own right. Letting it match as well would hide it from both
+    // lists and drop the role it declares.
+    if (!match || matchedLiveIds.has(match.id)) {
       repoOnlyAgents.push(entry);
       countRole(entry.role);
       continue;
     }
+    matchedLiveIds.add(match.id);
     // The live role is the role the agent holds now. What the repository intends
     // for it is a different question, and the drift lists answer that one.
-    if (!matchedLiveIds.has(match.id)) countRole(match.role);
-    matchedLiveIds.add(match.id);
+    countRole(match.role);
   }
 
   const dbOnlyAgents = live.filter((agent) => !matchedLiveIds.has(agent.id));

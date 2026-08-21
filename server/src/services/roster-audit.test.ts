@@ -50,6 +50,24 @@ describe("roster audit", () => {
     expect(report.dbOnlyAgents.map((agent) => agent.id)).toEqual(["live-id"]);
   });
 
+  it("reports a manifest that lists one agent twice, by id or by name", () => {
+    const byId = auditRoster(
+      [{ id: "a-1", name: "CEO", role: "lead" }, { id: "a-1", name: "CEO copy", role: "lead" }],
+      [{ id: "a-1", name: "CEO", role: "lead", status: "idle", hasCostHistory: true }],
+    );
+    expect(byId.repoOnlyAgents).toEqual([{ id: "a-1", name: "CEO copy", role: "lead" }]);
+    expect(byId.dbOnlyAgents).toEqual([]);
+    expect(byId.duplicateRoleFamilies).toEqual([{ role: "lead", count: 2 }]);
+
+    const byName = auditRoster(
+      [{ name: "CEO", role: "lead" }, { name: " ceo ", role: "lead" }],
+      [{ id: "a-1", name: "CEO", role: "lead", status: "idle", hasCostHistory: true }],
+    );
+    expect(byName.repoOnlyAgents).toEqual([{ name: " ceo ", role: "lead" }]);
+    expect(byName.dbOnlyAgents).toEqual([]);
+    expect(byName.duplicateRoleFamilies).toEqual([{ role: "lead", count: 2 }]);
+  });
+
   it("matches on name only when one live agent carries it", () => {
     const ambiguous = auditRoster(
       [{ name: "Engineer", role: "engineer" }],
