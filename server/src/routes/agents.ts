@@ -68,7 +68,7 @@ import {
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { auditRoster, type RosterManifestEntry } from "../services/roster-audit.js";
+import { auditRoster, parseRosterManifest, type RosterManifestEntry } from "../services/roster-audit.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -2840,10 +2840,13 @@ export function agentRoutes(
     let manifest: RosterManifestEntry[] = [];
     const rawManifest = typeof req.query.manifest === "string" ? req.query.manifest : process.env.PAPERCLIP_AGENT_MANIFEST;
     if (rawManifest) {
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(rawManifest);
-        manifest = Array.isArray(parsed) ? parsed.filter((entry): entry is RosterManifestEntry => entry && typeof entry.name === "string") : [];
+        parsed = JSON.parse(rawManifest);
       } catch { res.status(400).json({ error: "manifest must be a JSON array" }); return; }
+      const result = parseRosterManifest(parsed);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      manifest = result.manifest;
     }
     const live = await db.select({ id: agentsTable.id, name: agentsTable.name, role: agentsTable.role, status: agentsTable.status }).from(agentsTable).where(eq(agentsTable.companyId, companyId));
     const costRows = await db.select({ agentId: costEvents.agentId }).from(costEvents).where(eq(costEvents.companyId, companyId)).groupBy(costEvents.agentId);
