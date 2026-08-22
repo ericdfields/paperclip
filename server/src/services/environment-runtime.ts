@@ -3010,7 +3010,23 @@ function createPluginEnvironmentDriver(
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // Reached only once the plugin teardown above returned, so the provider
+      // resource is gone and cleanup is genuinely complete.
+      //
+      // A throwing teardown keeps its current behavior on purpose: the error
+      // propagates to `releaseRunLeases`, which reports it through
+      // `onLeaseReleaseError` and leaves the row `active`. Do not route that
+      // case to `pending_cleanup` the way the plugin-backed *sandbox* path
+      // does -- this driver implements no `retryPendingSandboxTeardown`, so the
+      // cleanup sweep can only throw on such a row, stranding it permanently.
+      return await environmentsSvc.releaseLease(input.lease.id, input.status, {
+        // Prefer the caller's concrete reason; fall back to the generic class
+        // only when the run supplied nothing, matching the sibling
+        // plugin-backed sandbox release.
+        failureReason:
+          input.status === "failed" ? input.failureReason ?? "adapter_or_run_failure" : undefined,
+        cleanupStatus: "success",
+      });
     },
 
     async resumeRunLease(input) {
