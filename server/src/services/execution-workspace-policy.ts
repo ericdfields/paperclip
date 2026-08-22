@@ -376,6 +376,33 @@ export function isExecutionWorkspaceIsolationDrift(input: {
   return !persistedExecutionWorkspaceIsolatesTree(input.existingWorkspaceMode);
 }
 
+/**
+ * The mode to record on an execution workspace the reuse path restores, or `null` to leave
+ * the recorded mode alone.
+ *
+ * The reuse path never wrote a mode at all, so a restored workspace kept the label of
+ * whichever mode first created it. `isExecutionWorkspaceIsolationDrift` already refuses
+ * reuse when the resolved mode wants a private tree and the bound workspace is a shared
+ * one, so the relabel left to do is between the two private modes: `isolated_workspace`
+ * and `operator_branch` resolve the same strategy from the same config
+ * (`resolveEffectiveWorkspaceStrategyType` never branches on which of the two it is), so
+ * the restored tree honors either and only the label is stale.
+ *
+ * A resolved mode that does not promise a private tree keeps the recorded mode: rewriting
+ * a physically private worktree to `shared_workspace` would be the same DB lie this fix
+ * exists to prevent, just pointing the other way.
+ */
+export function executionWorkspaceModeForReuse(input: {
+  resolvedMode: ParsedExecutionWorkspaceMode;
+  existingWorkspaceMode: string | null | undefined;
+}): "isolated_workspace" | "operator_branch" | null {
+  if (input.resolvedMode !== "isolated_workspace" && input.resolvedMode !== "operator_branch") {
+    return null;
+  }
+  if (!persistedExecutionWorkspaceIsolatesTree(input.existingWorkspaceMode)) return null;
+  return input.existingWorkspaceMode === input.resolvedMode ? null : input.resolvedMode;
+}
+
 export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;

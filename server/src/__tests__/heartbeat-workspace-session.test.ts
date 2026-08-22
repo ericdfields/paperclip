@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { executionWorkspaceModeForReuse } from "../services/execution-workspace-policy.ts";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -1840,6 +1841,29 @@ describe("effective run execution workspace config freshness", () => {
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: true,
     });
+  });
+
+  it("reuses the private tree across an isolated_workspace -> operator_branch flip, relabelled", () => {
+    // Both private modes realize through the same strategy, so rebuilding the tree on a flip
+    // would cost a worktree for nothing. Reuse stands; the stale label is what gets fixed, and
+    // it is fixed on the reuse path because the create arm is the only other writer of `mode`.
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-private",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      resolvedExecutionWorkspaceMode: "operator_branch",
+      existingExecutionWorkspaceMode: "isolated_workspace",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-private",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+    expect(
+      executionWorkspaceModeForReuse({
+        resolvedMode: "operator_branch",
+        existingWorkspaceMode: "isolated_workspace",
+      }),
+    ).toBe("operator_branch");
   });
 
   it("keeps reusing a shared workspace when the resolved mode is still shared", () => {

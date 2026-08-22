@@ -194,6 +194,7 @@ import {
 } from "./run-scratch.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
+  executionWorkspaceModeForReuse,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   issueExecutionWorkspaceModeForPersistence,
@@ -15179,9 +15180,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
     const branchNameForInitialPersistence =
       pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
+    // Only the create arm ever recorded a mode, so a restored workspace kept its original
+    // label even after the resolved mode moved on. Refusing reuse covers the shared -> private
+    // case; this covers the private -> private one, where the tree honors either mode and the
+    // label is the only thing left stale.
+    const reusedExecutionWorkspaceMode = reusableExistingExecutionWorkspace
+      ? executionWorkspaceModeForReuse({
+          resolvedMode: requestedExecutionWorkspaceMode,
+          existingWorkspaceMode: reusableExistingExecutionWorkspace.mode,
+        })
+      : null;
     try {
       persistedExecutionWorkspace = resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace
         ? await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
+            ...(reusedExecutionWorkspaceMode ? { mode: reusedExecutionWorkspaceMode } : {}),
             cwd: executionWorkspace.cwd,
             repoUrl: executionWorkspace.repoUrl,
             baseRef: executionWorkspace.repoRef,
