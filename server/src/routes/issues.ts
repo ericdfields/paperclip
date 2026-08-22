@@ -2817,6 +2817,33 @@ export function issueRoutes(
   });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
+  const feedback = feedbackService(db);
+  const companiesSvc = companyService(db);
+  let searchSvc = opts.searchService ?? null;
+  const getSearchService = () => {
+    searchSvc ??= companySearchService(db);
+    return searchSvc;
+  };
+  const searchRateLimiter = opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
+  const instanceSettings = instanceSettingsService(db);
+  const agentsSvc = agentService(db);
+  const projectsSvc = projectService(db);
+  const goalsSvc = goalService(db);
+  const issueApprovalsSvc = issueApprovalService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
+  const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
+  const workProductsSvc = workProductService(db);
+  const documentsSvc = documentService(db);
+  const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
+  const companySkillsSvc = companySkillService(db);
+  const documentAnnotationsSvc = documentAnnotationService(db);
+  const decisionTrainingSvc = decisionTrainingService(db);
+  const issueReferencesSvc = issueReferenceService(db);
+  const issueThreadInteractionsSvc = issueThreadInteractionService(db);
+  const memoizeIssueRead = createRequestPromiseMemo<Request, Awaited<ReturnType<typeof svc.getById>>>({
+    shouldCache: (issue) => issue !== null,
+  });
+  const memoizeIssueReadDecision = createRequestPromiseMemo<Request, Awaited<ReturnType<typeof decideIssueAccess>>>();
 
   /**
    * Wake the agent named by an issue's unblockDescriptor and record delivery.
@@ -2853,33 +2880,6 @@ export function issueRoutes(
     ));
     return ownerNotifiedAt;
   }
-  const feedback = feedbackService(db);
-  const companiesSvc = companyService(db);
-  let searchSvc = opts.searchService ?? null;
-  const getSearchService = () => {
-    searchSvc ??= companySearchService(db);
-    return searchSvc;
-  };
-  const searchRateLimiter = opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
-  const instanceSettings = instanceSettingsService(db);
-  const agentsSvc = agentService(db);
-  const projectsSvc = projectService(db);
-  const goalsSvc = goalService(db);
-  const issueApprovalsSvc = issueApprovalService(db);
-  const recoveryActionsSvc = issueRecoveryActionService(db);
-  const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
-  const workProductsSvc = workProductService(db);
-  const documentsSvc = documentService(db);
-  const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
-  const companySkillsSvc = companySkillService(db);
-  const documentAnnotationsSvc = documentAnnotationService(db);
-  const decisionTrainingSvc = decisionTrainingService(db);
-  const issueReferencesSvc = issueReferenceService(db);
-  const issueThreadInteractionsSvc = issueThreadInteractionService(db);
-  const memoizeIssueRead = createRequestPromiseMemo<Request, Awaited<ReturnType<typeof svc.getById>>>({
-    shouldCache: (issue) => issue !== null,
-  });
-  const memoizeIssueReadDecision = createRequestPromiseMemo<Request, Awaited<ReturnType<typeof decideIssueAccess>>>();
 
   function getIssueById(req: Request, id: string) {
     if (req.method !== "GET") return svc.getById(id);
