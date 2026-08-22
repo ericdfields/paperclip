@@ -292,6 +292,16 @@ export function pluginJobStore(db: Db) {
      * front, and — unlike a remembered cursor — this survives a restart,
      * because it is derived from `plugin_job_runs` rather than from memory.
      *
+     * The ordering deliberately counts **attempts, not completions**: every run
+     * row for the company, whatever its status, including one left `queued` or
+     * `running` by a restart that killed the handler mid-occurrence. Counting
+     * only terminal-successful runs would rank a company whose handler always
+     * dies ahead of everyone else on every occurrence — it would take a slot
+     * each time and never give it up, which is the starvation this ordering
+     * exists to prevent. The cost is bounded and the opposite of a drop: an
+     * interrupted company waits behind the companies queued ahead of it and is
+     * reached on the following occurrence.
+     *
      * @param pluginId - UUID of the plugin
      * @param jobId - UUID of the job whose run history orders the fan-out
      * @returns Company UUIDs, possibly empty

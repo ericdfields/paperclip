@@ -103,8 +103,12 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
     return pluginId;
   }
 
-  async function seedCompany(name: string, status = "active"): Promise<string> {
-    const companyId = randomUUID();
+  async function seedCompany(
+    name: string,
+    status = "active",
+    id?: string,
+  ): Promise<string> {
+    const companyId = id ?? randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name,
@@ -446,6 +450,58 @@ describeEmbeddedPostgres("company-scoped plugin jobs", () => {
     const servedSecond = second.captured.map((job) => job.companyId);
     expect(servedSecond).toHaveLength(2);
     expect([...servedFirst, ...servedSecond].sort()).toEqual([...seeded].sort());
+  });
+
+  it("counts an interrupted run as service, so a company that dies mid-run cannot monopolise the fan-out", async () => {
+    const pluginId = await seedPlugin();
+    // Deterministic ids, smallest first for the interrupted pair. The
+    // tiebreaker among never-run companies is `company_id asc`, so an ordering
+    // that counted only *completed* runs would rank these two first and serve
+    // them again — this test would then fail every time rather than on 5 runs
+    // out of 6.
+    // (They differ in the leading bytes, not the trailing ones, because the
+    // test's issue prefix is derived from the first six hex digits and has a
+    // unique index on it.)
+    const interrupted = [
+      await seedCompany("company a", "active", "10000000-0000-4000-8000-000000000000"),
+      await seedCompany("company b", "active", "20000000-0000-4000-8000-000000000000"),
+    ];
+    const neverRun = [
+      await seedCompany("company c", "active", "30000000-0000-4000-8000-000000000000"),
+      await seedCompany("company d", "active", "40000000-0000-4000-8000-000000000000"),
+    ];
+    const jobId = await seedDueJob(pluginId, "company");
+
+    // The occurrence that died: rows created, handlers never finished, no
+    // completion ever written. Nothing reaps them, so they stay `running`.
+    await db.insert(pluginJobRuns).values(
+      interrupted.map((companyId) => ({
+        jobId,
+        pluginId,
+        companyId,
+        trigger: "schedule" as const,
+        status: "running" as const,
+      })),
+    );
+
+    const { scheduler, captured } = createHarness({ maxConcurrentJobs: 2 });
+    await scheduler.tick();
+
+    // Fairness is over *attempts*, not completions — deliberately. Retrying
+    // the interrupted pair ahead of companies that have never run once is how
+    // a job that reliably dies mid-run for one tenant starves every other
+    // tenant forever. The interrupted companies are not dropped; they are
+    // behind the never-run pair, and the next occurrence reaches them.
+    expect(captured.map((job) => job.companyId).sort()).toEqual([...neverRun].sort());
+
+    await db
+      .update(pluginJobs)
+      .set({ nextRunAt: new Date(Date.now() - 60_000) })
+      .where(eq(pluginJobs.id, jobId));
+    await scheduler.tick();
+    expect(captured.slice(2).map((job) => job.companyId).sort()).toEqual(
+      [...interrupted].sort(),
+    );
   });
 
   it("stops dispatching to a company that disables the plugin mid-pass", async () => {
