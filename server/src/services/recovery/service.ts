@@ -5932,6 +5932,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     firstTimestamp!);
   }
 
+  /**
+   * True when a finding's dependency path is just the recovery issue itself.
+   *
+   * `reviewFinding(issue, issue, [issue])` produces these for an issue that is
+   * stranded on its own state rather than behind another issue. The lookback then
+   * compares the issue's `updatedAt` against itself, which cannot answer "has
+   * anything changed": a stranded issue stops being updated precisely because it is
+   * stranded, so it ages out of every window and is never escalated. Exclude these
+   * from the lookback. Findings that depend on a real blocker keep it, because there
+   * the blocker's `updatedAt` is a genuine signal that something moved.
+   */
+  function isSelfReferentialLivenessFinding(finding: IssueLivenessFinding) {
+    const dependencyIssueIds = [...new Set(finding.dependencyPath.map((entry) => entry.issueId))];
+    return dependencyIssueIds.length <= 1
+      && (dependencyIssueIds.length === 0 || dependencyIssueIds[0] === finding.recoveryIssueId);
+  }
+
   function isLivenessFindingInsideAutoRecoveryLookback(
     finding: IssueLivenessFinding,
     cutoff: Date,
@@ -6603,7 +6620,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     for (const finding of findings) {
-      if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {
+      if (
+        !isSelfReferentialLivenessFinding(finding)
+        && !isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)
+      ) {
         result.skippedOutsideLookback += 1;
         result.skipped += 1;
         continue;

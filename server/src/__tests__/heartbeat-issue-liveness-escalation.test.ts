@@ -843,6 +843,69 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+  async function seedSelfStrandedReviewIssue(opts: { idleHours: number }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Coder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+
+    const timestamp = new Date(Date.now() - opts.idleHours * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In review with no reviewer",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+
+    return { companyId, agentId, issueId };
+  }
+
+  it("escalates a self-stranded in_review issue even when it is older than the lookback window", async () => {
+    // An issue stranded on its own state has a dependency path of just itself, so the
+    // lookback compares its updatedAt against itself. A stranded issue stops being
+    // updated because it is stranded, so it ages out of every window and would never
+    // be escalated. 25 hours is outside the 24 hour default.
+    await enableAutoRecovery();
+    const { companyId } = await seedSelfStrandedReviewIssue({ idleHours: 25 });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    expect(result.skippedOutsideLookback).toBe(0);
+    expect(result.escalationsCreated).toBe(1);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+  });
+
   it("does not create recovery issues outside the configured lookback window", async () => {
     await enableAutoRecovery();
     const { companyId } = await seedBlockedChain({ outsideLookback: true });
