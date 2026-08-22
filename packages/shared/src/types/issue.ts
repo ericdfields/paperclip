@@ -445,6 +445,12 @@ export interface IssueReviewAttentionPath {
   responder: string | null;
   since: string | null;
   ref: string | null;
+  /**
+   * True when the path still exists but has gone quiet for longer than its kind allows,
+   * so it no longer satisfies the action-path requirement. Stale paths are still listed
+   * so the board can see which reviewer or interaction went quiet.
+   */
+  stale?: boolean;
 }
 
 export interface IssueReviewAttention {

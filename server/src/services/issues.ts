@@ -3075,6 +3075,7 @@ async function listIssueReviewAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      updatedAt: issue.updatedAt,
     })),
     relations: [],
     agents: agentRows,
@@ -3151,16 +3152,20 @@ async function listIssueReviewAttentionMap(
           ? (path.since instanceof Date ? path.since : new Date(path.since)).toISOString()
           : issue.updatedAt.toISOString(),
         ref: path.ref,
+        stale: path.stale,
       };
     });
 
-    if (paths.length > 0) {
+    // "Maintained" is the operative word: a path that exists but has gone quiet past its
+    // kind's bound is reported, but it does not make the review covered.
+    const livePaths = paths.filter((path) => !path.stale);
+    if (livePaths.length > 0) {
       result.set(issue.id, {
         state: "covered",
         paths,
-        reason: paths.length === 1
+        reason: livePaths.length === 1
           ? "Review has a maintained action path."
-          : `Review has ${paths.length} maintained action paths.`,
+          : `Review has ${livePaths.length} maintained action paths.`,
       });
       continue;
     }
@@ -3168,8 +3173,13 @@ async function listIssueReviewAttentionMap(
     const finding = findingsByIssueId.get(issue.id);
     result.set(issue.id, {
       state: "stalled",
-      paths: [],
-      reason: finding?.reason ?? "Issue is in review without a maintained action path.",
+      // Keep the stale paths on the response so the board can see what went quiet
+      // instead of just being told nothing is there.
+      paths,
+      reason: finding?.reason
+        ?? (paths.length > 0
+          ? `Review has ${paths.length === 1 ? "an action path that has" : "action paths that have"} gone stale, so nothing will wake it.`
+          : "Issue is in review without a maintained action path."),
     });
   }
 

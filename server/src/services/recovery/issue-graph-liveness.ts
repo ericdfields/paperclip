@@ -28,6 +28,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  updatedAt?: Date | string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -79,7 +80,44 @@ export interface IssueReviewPathFact {
   agentId: string | null;
   userId: string | null;
   since: Date | string | null;
+  /**
+   * True when this path still exists as a row but has gone quiet for longer than its
+   * kind allows. A stale path is reported so callers can explain *what* went quiet,
+   * but it does not satisfy the action-path requirement.
+   */
+  stale: boolean;
 }
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * How long a review path may go without progress before it stops counting as a
+ * maintained action path.
+ *
+ * The action-path requirement is checked when an issue enters `in_review`, but the
+ * paths it accepts are not self-renewing: a human reviewer can simply never look, a
+ * board interaction can sit unanswered, a queued wake can fail to start. Nothing about
+ * those outcomes changes the issue's status, so an entry-only check never runs again
+ * and the issue keeps claiming a reviewer it does not have. Bounding each kind by age
+ * turns the requirement into an invariant that decays back to `stalled` on its own.
+ *
+ * Kinds absent from this map are exempt because they already carry their own bound:
+ * `monitor` burns `maxAttempts`/`timeoutAt` (see `hasScheduledIssueMonitorPath`), and
+ * `recovery` points at an open recovery issue that has its own liveness classification.
+ */
+export const REVIEW_PATH_STALE_AFTER_MS: Partial<Record<IssueReviewPathFactKind, number>> = {
+  // Waits on a person or a board decision. A reviewer taking a day or two is normal; one
+  // who has not moved in three days is not reviewing, and the issue should say so.
+  human_reviewer: 3 * DAY_MS,
+  execution_participant: 3 * DAY_MS,
+  interaction: 3 * DAY_MS,
+  approval: 3 * DAY_MS,
+  // In-flight execution. These represent work that is supposed to be happening now, so a
+  // row still sitting here a day later means the run never started or never finished.
+  active_run: DAY_MS,
+  queued_wake: DAY_MS,
+};
 
 export interface IssueLivenessDependencyPathEntry {
   issueId: string;
@@ -208,6 +246,27 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
   return true;
 }
 
+/**
+ * True when a path of this kind, last touched at `since`, has gone quiet for longer
+ * than its kind allows. Paths that carry no timestamp of their own are measured from
+ * the issue's own `updatedAt`: any comment, status change, or reassignment refreshes
+ * it, so "the issue has not moved since X" is the right clock for a wait that has no
+ * other progress signal. An issue with no `updatedAt` at all is never called stale,
+ * so callers that do not supply it keep the previous behaviour.
+ */
+function isReviewPathStale(
+  kind: IssueReviewPathFactKind,
+  since: Date | string | null,
+  issue: IssueLivenessIssueInput,
+  nowMs: number,
+) {
+  const staleAfterMs = REVIEW_PATH_STALE_AFTER_MS[kind];
+  if (staleAfterMs === undefined) return false;
+  const sinceMs = readDateMs(since) ?? readDateMs(issue.updatedAt);
+  if (sinceMs === null) return false;
+  return nowMs - sinceMs > staleAfterMs;
+}
+
 export function classifyIssueReviewPaths(
   input: IssueGraphLivenessInput,
   issue: IssueLivenessIssueInput,
@@ -216,9 +275,12 @@ export function classifyIssueReviewPaths(
   const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const paths: IssueReviewPathFact[] = [];
+  const push = (fact: Omit<IssueReviewPathFact, "stale">) => {
+    paths.push({ ...fact, stale: isReviewPathStale(fact.kind, fact.since, issue, nowMs) });
+  };
 
   if (issue.assigneeUserId) {
-    paths.push({
+    push({
       kind: "human_reviewer",
       ref: issue.assigneeUserId,
       agentId: null,
@@ -234,7 +296,7 @@ export function classifyIssueReviewPaths(
   if (participantAgentId) {
     const participantAgent = agentsById.get(participantAgentId);
     if (participantAgent?.companyId === issue.companyId && isInvokableAgent(participantAgent, agentsById)) {
-      paths.push({
+      push({
         kind: "execution_participant",
         ref: participantAgentId,
         agentId: participantAgentId,
@@ -244,7 +306,7 @@ export function classifyIssueReviewPaths(
     }
   } else if (principalIsResolvableUser(participant)) {
     const userId = (participant as Record<string, unknown>).userId as string;
-    paths.push({
+    push({
       kind: "execution_participant",
       ref: userId,
       agentId: null,
@@ -254,7 +316,7 @@ export function classifyIssueReviewPaths(
   }
 
   if (hasScheduledIssueMonitorPath(issue, nowMs)) {
-    paths.push({ kind: "monitor", ref: null, agentId: issue.assigneeAgentId ?? null, userId: null, since: null });
+    push({ kind: "monitor", ref: null, agentId: issue.assigneeAgentId ?? null, userId: null, since: null });
   }
 
   const appendExecutionPaths = (
@@ -263,7 +325,7 @@ export function classifyIssueReviewPaths(
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
-      paths.push({
+      push({
         kind,
         ref: entry.id ?? null,
         agentId: entry.agentId ?? null,
@@ -281,7 +343,7 @@ export function classifyIssueReviewPaths(
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
-      paths.push({
+      push({
         kind,
         ref: entry.id ?? null,
         agentId: null,
@@ -526,7 +588,11 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
     if (reviewIssue.status !== "in_review") return null;
-    if (classifyIssueReviewPaths(input, reviewIssue).length > 0) return null;
+    // Only a live path counts. A stale one is still reported on the issue so the board
+    // can see which reviewer went quiet, but it must not suppress the finding.
+    const reviewPaths = classifyIssueReviewPaths(input, reviewIssue);
+    if (reviewPaths.some((path) => !path.stale)) return null;
+    const stalePathKinds = [...new Set(reviewPaths.map((path) => path.kind))].sort();
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {
       includeStalledAssignee: true,
@@ -557,9 +623,15 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (principalIsResolvableUser(participant)) return null;
+    // A resolvable user participant is a real path only while it is live. If it is live
+    // the issue is fine; if it has gone stale the issue is stranded on a person who is
+    // not coming back, which is `in_review_without_action_path` below — not an invalid
+    // participant. `invalid_review_participant` stays reserved for a participant that
+    // cannot be resolved at all, so a resolvable one must not fall into that branch.
+    const hasResolvableUserParticipant = principalIsResolvableUser(participant);
+    if (hasResolvableUserParticipant && stalePathKinds.length === 0) return null;
 
-    if (hasPendingExecutionState) {
+    if (hasPendingExecutionState && !hasResolvableUserParticipant) {
       return finding({
         issue: source,
         state: "invalid_review_participant",
@@ -573,12 +645,18 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (!reviewIssue.assigneeAgentId || reviewIssue.assigneeUserId) return null;
+    // An issue with neither an agent assignee nor a stale path to explain has no next
+    // action to describe here; other states cover the unowned shapes. But once a path
+    // has gone stale the issue is stranded no matter who it is assigned to, so a user
+    // assignee no longer suppresses the finding.
+    if (!reviewIssue.assigneeAgentId && stalePathKinds.length === 0) return null;
 
     return finding({
       issue: source,
       state: "in_review_without_action_path",
-      reason: `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
+      reason: stalePathKinds.length > 0
+        ? `${issueLabel(reviewIssue)} is in review, but every path owning the next action has gone stale (${stalePathKinds.join(", ")}). Nothing will wake it.`
+        : `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
       dependencyPath,
       recoveryIssue: reviewIssue,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
@@ -613,11 +691,15 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (hasExplicitWaitingPath(blocker)) return null;
-
+    // `in_review` is classified by `reviewFinding` first, because it applies the
+    // staleness rule that `hasExplicitWaitingPath` does not. Checking the coarse gate
+    // first would let a blocked chain mask a stranded review that the same issue would
+    // report as stranded at top level — two gates disagreeing about one invariant.
     if (blocker.status === "in_review") {
       return reviewFinding(source, blocker, dependencyPath);
     }
+
+    if (hasExplicitWaitingPath(blocker)) return null;
 
     if (blocker.status === "backlog" && blocker.assigneeAgentId) {
       return finding({

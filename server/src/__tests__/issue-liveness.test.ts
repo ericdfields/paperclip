@@ -628,3 +628,144 @@ describe("issue graph liveness classifier", () => {
     });
   });
 });
+
+describe("in_review action-path staleness", () => {
+  const reviewIssueId = "review-1";
+  const now = new Date("2026-08-22T00:00:00.000Z");
+
+  function agedReview(overrides: Record<string, unknown>, updatedAt: string) {
+    return issue({
+      id: reviewIssueId,
+      identifier: "PAP-2279",
+      title: "Screenshot acceptance review",
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionState: null,
+      updatedAt,
+      ...overrides,
+    });
+  }
+
+  function classify(issueInput: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    return classifyIssueGraphLiveness({
+      issues: [issueInput],
+      relations: [],
+      agents: [agent(), manager],
+      now,
+      ...extra,
+    });
+  }
+
+  it("flags a review whose human reviewer has gone quiet past the bound", () => {
+    // The BRO-1631 shape: assigned to a person, untouched for weeks, and previously
+    // reported as covered forever because a `human_reviewer` path existed.
+    const findings = classify(
+      agedReview({ assigneeAgentId: coderId, assigneeUserId: "board-user-1" }, "2026-07-27T00:00:00.000Z"),
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_without_action_path",
+      recoveryIssueId: reviewIssueId,
+    });
+    expect(findings[0]?.reason).toContain("human_reviewer");
+  });
+
+  it("leaves a recent human reviewer alone", () => {
+    const findings = classify(
+      agedReview({ assigneeAgentId: coderId, assigneeUserId: "board-user-1" }, "2026-08-21T00:00:00.000Z"),
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("flags a review whose only user participant has gone quiet past the bound", () => {
+    const findings = classify(
+      agedReview(
+        {
+          assigneeUserId: null,
+          executionState: { status: "pending", currentParticipant: { type: "user", userId: "board-user-1" } },
+        },
+        "2026-07-28T00:00:00.000Z",
+      ),
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ state: "in_review_without_action_path" });
+    expect(findings[0]?.reason).toContain("execution_participant");
+  });
+
+  it("flags a review whose only interaction has sat unanswered past the bound", () => {
+    const findings = classify(agedReview({}, "2026-08-01T00:00:00.000Z"), {
+      pendingInteractions: [
+        { companyId, issueId: reviewIssueId, status: "pending", createdAt: "2026-08-01T00:00:00.000Z" },
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain("interaction");
+  });
+
+  it("flags a queued wake that never started", () => {
+    // A wake request row is a path only while it is plausibly about to run. Left queued
+    // for a day it is a dead path that still reads as coverage.
+    const findings = classify(agedReview({}, "2026-08-20T00:00:00.000Z"), {
+      queuedWakeRequests: [
+        { companyId, issueId: reviewIssueId, agentId: coderId, status: "queued", createdAt: "2026-08-20T00:00:00.000Z" },
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain("queued_wake");
+  });
+
+  it("keeps a live path authoritative when a stale one sits beside it", () => {
+    const findings = classify(
+      agedReview({ assigneeUserId: "board-user-1" }, "2026-07-27T00:00:00.000Z"),
+      {
+        activeRuns: [
+          { companyId, issueId: reviewIssueId, agentId: coderId, status: "running", createdAt: "2026-08-21T23:00:00.000Z" },
+        ],
+      },
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("exempts a scheduled monitor, which bounds itself through maxAttempts", () => {
+    const findings = classify(
+      agedReview(
+        {
+          executionPolicy: { monitor: { maxAttempts: 5 } },
+          monitorNextCheckAt: "2026-08-22T06:00:00.000Z",
+          monitorAttemptCount: 1,
+        },
+        "2026-07-01T00:00:00.000Z",
+      ),
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("does not call any path stale when the issue carries no updatedAt", () => {
+    // Callers that do not supply updatedAt keep the previous behaviour.
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "PAP-2279",
+          title: "Screenshot acceptance review",
+          status: "in_review",
+          assigneeAgentId: coderId,
+          assigneeUserId: "board-user-1",
+          executionState: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+      now,
+    });
+
+    expect(findings).toEqual([]);
+  });
+});
