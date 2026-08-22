@@ -906,6 +906,24 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations).toHaveLength(1);
   });
 
+  it("previews a self-stranded in_review issue that is older than the lookback window", async () => {
+    // The preview exists so an operator can size the batch before it runs. It must
+    // apply the same exemption as reconciliation, or it hides exactly the findings
+    // that the next reconciliation is about to escalate.
+    await enableAutoRecovery();
+    await seedSelfStrandedReviewIssue({ idleHours: 25 });
+    const heartbeat = heartbeatService(db);
+
+    const preview = await heartbeat.buildIssueGraphLivenessAutoRecoveryPreview();
+
+    expect(preview.skippedOutsideLookback).toBe(0);
+    expect(preview.items).toHaveLength(1);
+    expect(preview.items[0]).toMatchObject({ state: "in_review_without_action_path" });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.escalationsCreated).toBe(preview.items.length);
+  });
+
   it("does not create recovery issues outside the configured lookback window", async () => {
     await enableAutoRecovery();
     const { companyId } = await seedBlockedChain({ outsideLookback: true });

@@ -5982,7 +5982,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         finding,
         updatedAtByIssueKey,
       );
-      if (!latestDependencyUpdatedAt || latestDependencyUpdatedAt < cutoff) {
+      if (!latestDependencyUpdatedAt) {
+        skippedOutsideLookback += 1;
+        continue;
+      }
+      // Mirror the reconciliation exemption for self-referential findings. The preview
+      // exists so an operator can size the next batch before it runs, so it has to
+      // apply the same rule. If it kept the unconditional lookback it would hide the
+      // findings the next reconciliation is about to escalate.
+      if (!isSelfReferentialLivenessFinding(finding) && latestDependencyUpdatedAt < cutoff) {
         skippedOutsideLookback += 1;
         continue;
       }
