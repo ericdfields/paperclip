@@ -13705,6 +13705,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function sweepExpiredRunLeases(): Promise<{
     swept: number;
     released: number;
+    deferred: number;
     skippedWithoutRun: number;
   }> {
     const now = new Date();
@@ -13740,7 +13741,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
         ),
       )
-      .orderBy(asc(environmentLeases.expiresAt))
+      // Oldest-touched first, not oldest-expired first. A lease whose release
+      // keeps failing holds its `expires_at` forever, so ordering by expiry
+      // would re-select the same full page every tick and starve every lease
+      // behind it. The deferral below moves a failed lease to the back of this
+      // order, which is the same rotation `sweepPendingCleanupLeases` uses.
+      .orderBy(asc(environmentLeases.updatedAt), asc(environmentLeases.expiresAt))
       .limit(EXPIRED_LEASE_SWEEP_PAGE_SIZE);
 
     // One release call per run: `releaseRunLeases` is keyed by run, and a run
@@ -13750,13 +13756,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let released = 0;
     for (const runId of runIds) {
       const errors: Array<{ leaseId: string }> = [];
-      const releasedLeases = await environmentRuntime.releaseRunLeases(
-        runId,
-        "expired",
-        (leaseId) => errors.push({ leaseId }),
-        EXPIRED_LEASE_SWEEP_FAILURE_REASON,
-      );
-      released += releasedLeases.length;
+      try {
+        const releasedLeases = await environmentRuntime.releaseRunLeases(
+          runId,
+          "expired",
+          (leaseId) => errors.push({ leaseId }),
+          EXPIRED_LEASE_SWEEP_FAILURE_REASON,
+        );
+        released += releasedLeases.length;
+      } catch {
+        // One run's release must not abandon the rest of the page. The lease
+        // stays active and the deferral below rotates it to the back. Log a
+        // constant errorKind only: the exception can carry a credential in its
+        // name, code, message, cause, or stack.
+        errors.push(...rows.filter((row) => row.heartbeatRunId === runId).map((row) => ({ leaseId: row.leaseId })));
+      }
       if (errors.length > 0) {
         logger.warn(
           { errorKind: EXPIRED_LEASE_SWEEP_ERROR_KIND, runId, leaseIds: errors.map((e) => e.leaseId) },
@@ -13765,6 +13779,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // Rotate whatever this page failed to release. Any row still `active` was
+    // not released, whether the driver threw, reported an error, or simply
+    // returned nothing for it — touching `updated_at` is what stops the next
+    // tick handing it the identical page. This is deliberately keyed on the
+    // observed row state rather than on the error callback, because a silent
+    // no-op would starve the sweep just as effectively as a loud failure.
+    const deferred = rows.length > 0
+      ? await db
+        .update(environmentLeases)
+        .set({ updatedAt: new Date() })
+        .where(
+          and(
+            inArray(environmentLeases.id, rows.map((row) => row.leaseId)),
+            eq(environmentLeases.status, "active"),
+          ),
+        )
+        .returning({ id: environmentLeases.id })
+      : [];
+
     if (orphanCount && orphanCount.count > 0) {
       logger.warn(
         { count: orphanCount.count },
@@ -13772,7 +13805,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    return { swept: rows.length, released, skippedWithoutRun: orphanCount?.count ?? 0 };
+    return {
+      swept: rows.length,
+      released,
+      deferred: deferred.length,
+      skippedWithoutRun: orphanCount?.count ?? 0,
+    };
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {

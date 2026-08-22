@@ -218,7 +218,7 @@ describeEmbeddedPostgres("heartbeat sweepExpiredRunLeases", () => {
 
     const result = await heartbeat.sweepExpiredRunLeases();
 
-    expect(result).toEqual({ swept: 1, released: 1, skippedWithoutRun: 0 });
+    expect(result).toEqual({ swept: 1, released: 1, deferred: 0, skippedWithoutRun: 0 });
     expect(releaseRunLeases).toHaveBeenCalledTimes(1);
     expect(releaseRunLeases.mock.calls[0]?.[0]).toBe(runId);
     expect(releaseRunLeases.mock.calls[0]?.[1]).toBe("expired");
@@ -260,7 +260,7 @@ describeEmbeddedPostgres("heartbeat sweepExpiredRunLeases", () => {
 
     const result = await heartbeat.sweepExpiredRunLeases();
 
-    expect(result).toEqual({ swept: 0, released: 0, skippedWithoutRun: 0 });
+    expect(result).toEqual({ swept: 0, released: 0, deferred: 0, skippedWithoutRun: 0 });
     expect(releaseRunLeases).not.toHaveBeenCalled();
 
     for (const leaseId of [runningLease, queuedLease]) {
@@ -298,7 +298,7 @@ describeEmbeddedPostgres("heartbeat sweepExpiredRunLeases", () => {
 
     const result = await heartbeat.sweepExpiredRunLeases();
 
-    expect(result).toEqual({ swept: 0, released: 0, skippedWithoutRun: 0 });
+    expect(result).toEqual({ swept: 0, released: 0, deferred: 0, skippedWithoutRun: 0 });
     expect(releaseRunLeases).not.toHaveBeenCalled();
     for (const leaseId of [future, legacy]) {
       const status = await db
@@ -327,12 +327,80 @@ describeEmbeddedPostgres("heartbeat sweepExpiredRunLeases", () => {
 
     const result = await heartbeat.sweepExpiredRunLeases();
 
-    expect(result).toEqual({ swept: 0, released: 0, skippedWithoutRun: 1 });
+    expect(result).toEqual({ swept: 0, released: 0, deferred: 0, skippedWithoutRun: 1 });
     expect(releaseRunLeases).not.toHaveBeenCalled();
     expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
       { count: 1 },
       "expired leases with no heartbeat run are not swept by this path",
     );
+  });
+
+  // Head-of-line blocking. A lease whose release keeps failing keeps its
+  // `expires_at`, so an oldest-expired-first page would hand the sweep the
+  // identical failing rows on every tick and nothing behind them would ever be
+  // reached. The deferral touch is what rotates them out of the way.
+  it("test_expired_lease_sweep_makes_progress_past_a_full_page_of_failures", async () => {
+    const { companyId, agentId, environmentId } = await seedCompanyAndEnvironment();
+
+    // A full page of leases whose release always fails, all expired long ago so
+    // they sort ahead of the victim below on any expiry-ordered scan.
+    const stuckRuns = new Set<string>();
+    for (let index = 0; index < SWEEP_PAGE_SIZE; index += 1) {
+      const runId = await insertRun({ companyId, agentId, status: "failed" });
+      stuckRuns.add(runId);
+      await insertActiveLease({
+        companyId,
+        environmentId,
+        heartbeatRunId: runId,
+        expiresAt: new Date(Date.now() - 48 * HOUR_MS),
+      });
+    }
+
+    // The lease that must not be starved: expired, but more recently.
+    const victimRun = await insertRun({ companyId, agentId, status: "succeeded" });
+    const victimLease = await insertActiveLease({
+      companyId,
+      environmentId,
+      heartbeatRunId: victimRun,
+      expiresAt: new Date(Date.now() - HOUR_MS),
+    });
+
+    const { runtime, releaseRunLeases } = fakeRuntime();
+    const failing = vi.fn(async (heartbeatRunId: string, ...rest: unknown[]) => {
+      if (stuckRuns.has(heartbeatRunId)) throw new Error("driver teardown refused");
+      return await (releaseRunLeases as unknown as (...args: unknown[]) => Promise<unknown>)(
+        heartbeatRunId,
+        ...rest,
+      );
+    });
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: { releaseRunLeases: failing } as unknown as HeartbeatEnvironmentRuntime,
+    });
+
+    // Tick one: the failing page fills the sweep, so the victim is not reached.
+    const first = await heartbeat.sweepExpiredRunLeases();
+    expect(first.swept).toBe(SWEEP_PAGE_SIZE);
+    expect(first.released).toBe(0);
+    expect(first.deferred).toBe(SWEEP_PAGE_SIZE);
+    expect(
+      await db
+        .select({ status: environmentLeases.status })
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, victimLease))
+        .then((rows) => rows[0]?.status),
+    ).toBe("active");
+
+    // Tick two: the deferred failures now sort last, so the victim is reached
+    // and released. Without the deferral this is the same page as tick one.
+    const second = await heartbeat.sweepExpiredRunLeases();
+    expect(second.released).toBe(1);
+    expect(
+      await db
+        .select({ status: environmentLeases.status })
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, victimLease))
+        .then((rows) => rows[0]?.status),
+    ).toBe("expired");
   });
 
   it("test_expired_lease_sweep_batches_one_release_per_run_and_honours_page_size", async () => {
