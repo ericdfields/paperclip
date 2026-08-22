@@ -848,6 +848,13 @@ export interface Issue {
   unblockDescriptor?: IssueUnblockDescriptor | null;
   blockedTransitionAt?: Date | null;
   blockedOwnerNotifiedAt?: Date | null;
+  /**
+   * When the issue last entered `in_review`. This is the clock a review path with no
+   * activity of its own is aged against: unlike `updatedAt` it is not refreshed by
+   * comments or unrelated edits, so a reviewer who never acts cannot be revived by
+   * traffic on the issue around them.
+   */
+  reviewTransitionAt?: Date | null;
   productivityReview?: IssueProductivityReview | null;
   activeRecoveryAction?: IssueRecoveryAction | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;

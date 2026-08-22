@@ -633,7 +633,7 @@ describe("in_review action-path staleness", () => {
   const reviewIssueId = "review-1";
   const now = new Date("2026-08-22T00:00:00.000Z");
 
-  function agedReview(overrides: Record<string, unknown>, updatedAt: string) {
+  function agedReview(overrides: Record<string, unknown>, reviewTransitionAt: string) {
     return issue({
       id: reviewIssueId,
       identifier: "PAP-2279",
@@ -641,7 +641,10 @@ describe("in_review action-path staleness", () => {
       status: "in_review",
       assigneeAgentId: coderId,
       executionState: null,
-      updatedAt,
+      reviewTransitionAt,
+      // Fresh, and deliberately so: every case below must turn on the review clock, never
+      // on when the issue was last touched.
+      updatedAt: "2026-08-21T23:59:00.000Z",
       ...overrides,
     });
   }
@@ -747,8 +750,8 @@ describe("in_review action-path staleness", () => {
     expect(findings).toEqual([]);
   });
 
-  it("does not call any path stale when the issue carries no updatedAt", () => {
-    // Callers that do not supply updatedAt keep the previous behaviour.
+  it("does not call any path stale when the issue carries no review clock", () => {
+    // Callers that do not supply reviewTransitionAt keep the previous behaviour.
     const findings = classifyIssueGraphLiveness({
       issues: [
         issue({
@@ -765,6 +768,54 @@ describe("in_review action-path staleness", () => {
       agents: [agent(), manager],
       now,
     });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("does not revive a quiet reviewer when unrelated activity touches the issue", () => {
+    // The regression this column exists for. Comments — including the platform's own
+    // re-triage sweeps — move `updatedAt`, and while that was the clock, a reviewer who
+    // had done nothing for a month was renewed by the very automation sent to find them.
+    const findings = classify(
+      agedReview(
+        { assigneeUserId: "board-user-1", updatedAt: "2026-08-22T00:00:00.000Z" },
+        "2026-07-27T00:00:00.000Z",
+      ),
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ state: "in_review_without_action_path" });
+    expect(findings[0]?.reason).toContain("human_reviewer");
+  });
+
+  it("keeps a long-running execution live however long the issue itself has been quiet", () => {
+    // A run is aged by the run, never by the issue around it. An agent still working a
+    // long job on an issue that entered review weeks ago must not be escalated as a dead
+    // path while it is mid-flight.
+    const findings = classify(
+      agedReview({ assigneeUserId: "board-user-1" }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          { companyId, issueId: reviewIssueId, agentId: coderId, status: "running", createdAt: "2026-08-21T18:00:00.000Z" },
+        ],
+      },
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("never ages a row-backed path off the review clock when its own timestamp is missing", () => {
+    // A caller that forgets to select `createdAt` must degrade to "unknown", not to
+    // "stale". Aging this run off the review clock would report a live execution as no
+    // action path at all.
+    const findings = classify(
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          { companyId, issueId: reviewIssueId, agentId: coderId, status: "running" },
+        ],
+      },
+    );
 
     expect(findings).toEqual([]);
   });

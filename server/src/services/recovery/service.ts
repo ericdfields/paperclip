@@ -5461,7 +5461,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         monitorAttemptCount: issues.monitorAttemptCount,
-        updatedAt: issues.updatedAt,
+        reviewTransitionAt: issues.reviewTransitionAt,
       })
       .from(issues)
       .where(
@@ -5509,6 +5509,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           contextSnapshot: heartbeatRuns.contextSnapshot,
+          createdAt: heartbeatRuns.createdAt,
         })
         .from(heartbeatRuns)
         .where(inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])),
@@ -5518,6 +5519,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           issueId: issues.id,
+          createdAt: heartbeatRuns.createdAt,
         })
         .from(issues)
         .innerJoin(heartbeatRuns, eq(issues.executionRunId, heartbeatRuns.id))
@@ -5534,6 +5536,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId: agentWakeupRequests.agentId,
           status: agentWakeupRequests.status,
           payload: agentWakeupRequests.payload,
+          createdAt: agentWakeupRequests.requestedAt,
         })
         .from(agentWakeupRequests)
         .where(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])),
@@ -5542,6 +5545,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           companyId: issueThreadInteractions.companyId,
           issueId: issueThreadInteractions.issueId,
           status: issueThreadInteractions.status,
+          createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.status, "pending")),
@@ -5550,6 +5554,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           companyId: issueApprovals.companyId,
           issueId: issueApprovals.issueId,
           status: approvals.status,
+          createdAt: approvals.createdAt,
         })
         .from(issueApprovals)
         .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
@@ -5648,17 +5653,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromRunContext(row.contextSnapshot),
+        createdAt: row.createdAt,
       })).concat(activeIssueRunRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
         issueId: row.issueId,
+        createdAt: row.createdAt,
       }))),
       queuedWakeRequests: wakeRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
+        createdAt: row.createdAt,
       })),
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,

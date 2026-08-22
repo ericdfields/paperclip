@@ -28,7 +28,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
-  updatedAt?: Date | string | null;
+  reviewTransitionAt?: Date | string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -118,6 +118,17 @@ export const REVIEW_PATH_STALE_AFTER_MS: Partial<Record<IssueReviewPathFactKind,
   active_run: DAY_MS,
   queued_wake: DAY_MS,
 };
+
+/**
+ * The path kinds that have no row of their own to age against. A `human_reviewer` is just
+ * an id on the issue and an `execution_participant` just an entry in `executionState`;
+ * neither carries a timestamp, so both are measured from when review began. Every other
+ * kind is backed by a row with its own `createdAt` and must be aged by that alone.
+ */
+const REVIEW_PATH_KINDS_AGED_BY_REVIEW_CLOCK: ReadonlySet<IssueReviewPathFactKind> = new Set([
+  "human_reviewer",
+  "execution_participant",
+]);
 
 export interface IssueLivenessDependencyPathEntry {
   issueId: string;
@@ -248,11 +259,21 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
 
 /**
  * True when a path of this kind, last touched at `since`, has gone quiet for longer
- * than its kind allows. Paths that carry no timestamp of their own are measured from
- * the issue's own `updatedAt`: any comment, status change, or reassignment refreshes
- * it, so "the issue has not moved since X" is the right clock for a wait that has no
- * other progress signal. An issue with no `updatedAt` at all is never called stale,
- * so callers that do not supply it keep the previous behaviour.
+ * than its kind allows.
+ *
+ * A path is aged only by a clock that belongs to it. Rows that carry their own
+ * timestamp — runs, queued wakes, interactions, approvals — are measured from it, so a
+ * run that started ten minutes ago is live no matter how long the issue around it has
+ * been quiet. The waits with no row of their own (`human_reviewer`,
+ * `execution_participant`) are measured from `reviewTransitionAt`, the moment review
+ * began.
+ *
+ * `updatedAt` is deliberately not a fallback here. It is refreshed by any comment or
+ * unrelated edit, which made it both too harsh (a live run on a quiet issue read as
+ * stale) and too generous (routine status comments — including the platform's own
+ * re-triage sweeps — renewed a reviewer who had done nothing, indefinitely). An issue
+ * with no clock at all is never called stale, so a caller that supplies neither keeps
+ * the previous behaviour.
  */
 function isReviewPathStale(
   kind: IssueReviewPathFactKind,
@@ -262,7 +283,13 @@ function isReviewPathStale(
 ) {
   const staleAfterMs = REVIEW_PATH_STALE_AFTER_MS[kind];
   if (staleAfterMs === undefined) return false;
-  const sinceMs = readDateMs(since) ?? readDateMs(issue.updatedAt);
+  // A row-backed path is aged by its own row or not at all. If a caller does not supply
+  // the timestamp, the honest reading is "unknown", and unknown must never resolve to
+  // stale: that is how a running execution gets classified as a dead path and escalated
+  // out from under itself.
+  const sinceMs = REVIEW_PATH_KINDS_AGED_BY_REVIEW_CLOCK.has(kind)
+    ? readDateMs(since) ?? readDateMs(issue.reviewTransitionAt)
+    : readDateMs(since);
   if (sinceMs === null) return false;
   return nowMs - sinceMs > staleAfterMs;
 }
