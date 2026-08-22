@@ -1,6 +1,29 @@
+import { createHash } from "node:crypto";
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 
 export const ROUTABLE_BLOCKED_ROLLOUT_AT = new Date("2026-07-23T18:13:03.000Z");
+
+/**
+ * Stable discriminator for "which descriptor was this owner told about".
+ *
+ * The idempotency key has to change when the descriptor changes, otherwise
+ * re-pointing an already-blocked issue at a new owner reuses the previous
+ * key, the wakeup is silently deduplicated, and the new owner is never told.
+ */
+export function unblockDescriptorFingerprint(descriptor: IssueUnblockDescriptor): string {
+  const owner = descriptor.owner;
+  const ownerKey = owner === "board"
+    ? "board"
+    : "agentId" in owner
+      ? `agent:${owner.agentId}`
+      : `user:${owner.userId}`;
+  // JSON.stringify keeps the two fields unambiguously delimited, so an action
+  // text containing the separator cannot forge another owner's key.
+  return createHash("sha256")
+    .update(JSON.stringify([ownerKey, descriptor.action]))
+    .digest("hex")
+    .slice(0, 12);
+}
 
 type RoutableBlockedIssue = {
   id: string;
@@ -45,7 +68,9 @@ export async function deliverAgentUnblockNotification(input: {
     source: "automation",
     triggerDetail: "system",
     reason: "issue_unblock_requested",
-    idempotencyKey: `issue-unblock:${issue.id}:${issue.blockedTransitionAt.toISOString()}`,
+    idempotencyKey: `issue-unblock:${issue.id}:${issue.blockedTransitionAt.toISOString()}:${
+      unblockDescriptorFingerprint(issue.unblockDescriptor)
+    }`,
     payload: { issueId: issue.id, action: issue.unblockDescriptor.action },
     contextSnapshot: { wakeReason: "issue_unblock_requested", issueId: issue.id, taskId: issue.id },
   });
