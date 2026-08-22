@@ -979,6 +979,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         heartbeatRunId: input.heartbeatRunId,
         leasePolicy: "ephemeral",
         provider: "local",
+        expiresAt: inProcessRunLeaseExpiry(input),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
@@ -1006,6 +1007,37 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       };
     },
   };
+}
+
+/**
+ * How long an in-process run lease (local, ssh) stays valid when nothing
+ * releases it.
+ *
+ * The value is not a guess at how long a run takes. It is the point past which
+ * recovery itself stops believing a silent run is alive — the same four hours
+ * as `ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS` in `recovery/service.ts`. Before
+ * that boundary a lease still plausibly belongs to live work; after it, either
+ * recovery has already terminalized the run (which releases the lease through
+ * the normal path) or nothing ever will.
+ *
+ * Deliberately not imported from `recovery/service.js`: this module sits below
+ * recovery in the dependency order and must stay there. The two values are
+ * pinned together by an assertion in `environment-runtime.test.ts` instead, so
+ * a change to one fails the suite rather than drifting silently.
+ */
+export const IN_PROCESS_RUN_LEASE_TTL_MS = 4 * 60 * 60 * 1000;
+
+/**
+ * The expiry to stamp on a lease held by a driver with no provider-side lease
+ * of its own. A caller-supplied expiry wins — adapter logins negotiate their
+ * own — but absent one, the lease still gets a bound. A lease with a null
+ * `expires_at` is a waiting state with no recorded way out, which is why every
+ * one of these rows leaked: no sweep can select on a column nothing writes.
+ */
+function inProcessRunLeaseExpiry(input: EnvironmentDriverAcquireInput, now: Date = new Date()): Date {
+  return input.requestedExpiresAt instanceof Date && !Number.isNaN(input.requestedExpiresAt.getTime())
+    ? input.requestedExpiresAt
+    : new Date(now.getTime() + IN_PROCESS_RUN_LEASE_TTL_MS);
 }
 
 /**
@@ -1052,6 +1084,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         leasePolicy: "ephemeral",
         provider: "ssh",
         providerLeaseId: `ssh://${parsed.config.username}@${parsed.config.host}:${parsed.config.port}${remoteCwd}`,
+        expiresAt: inProcessRunLeaseExpiry(input),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,

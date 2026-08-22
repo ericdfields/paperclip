@@ -30,11 +30,13 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.ts";
 import {
+  IN_PROCESS_RUN_LEASE_TTL_MS,
   SANDBOX_CAPABILITY_KEYS,
   environmentRuntimeService,
   findReusableSandboxLeaseId,
   SandboxOrphanCleanupWriteError,
 } from "../services/environment-runtime.ts";
+import { ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS } from "../services/recovery/service.ts";
 import * as sandboxProviderRuntime from "../services/sandbox-provider-runtime.ts";
 import * as environmentsModule from "../services/environments.ts";
 import { logger } from "../middleware/logger.ts";
@@ -6381,6 +6383,64 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       .where(eq(environmentLeases.id, acquired.lease.id));
     expect(cleanRows[0]?.failureReason).toBeNull();
     expect(cleanRows[0]?.cleanupStatus).toBe("success");
+  });
+
+  it("stamps an expiry on a local run lease so a sweep can find it", async () => {
+    const { companyId, environment, runId } = await seedEnvironment({ driver: "local" });
+
+    const before = Date.now();
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    const after = Date.now();
+
+    // Every historical row has a null expires_at because this driver passed
+    // none. A lease with no expiry is a waiting state no reaper can select on,
+    // which is why no reaper was ever written.
+    const row = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, acquired.lease.id))
+      .then((rows) => rows[0]);
+    expect(row?.expiresAt).toBeInstanceOf(Date);
+    const expiresAt = row!.expiresAt!.getTime();
+    expect(expiresAt).toBeGreaterThanOrEqual(before + IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(expiresAt).toBeLessThanOrEqual(after + IN_PROCESS_RUN_LEASE_TTL_MS);
+  });
+
+  it("honours a caller-supplied lease expiry instead of the default TTL", async () => {
+    const { companyId, environment, runId } = await seedEnvironment({ driver: "local" });
+
+    // Adapter logins negotiate their own window. The default is a fallback for
+    // callers that ask for nothing, not an override of one that does.
+    const requestedExpiresAt = new Date(Date.now() + 90 * 1000);
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+      requestedExpiresAt,
+    });
+
+    const row = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, acquired.lease.id))
+      .then((rows) => rows[0]);
+    expect(row?.expiresAt?.getTime()).toBe(requestedExpiresAt.getTime());
+  });
+
+  // The TTL is deliberately the point past which recovery stops believing a
+  // silent run is alive. It is duplicated rather than imported, because
+  // environment-runtime sits below recovery in the dependency order -- so this
+  // assertion is what stops the two drifting apart.
+  it("pins the in-process lease TTL to the recovery critical threshold", () => {
+    expect(IN_PROCESS_RUN_LEASE_TTL_MS).toBe(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
   });
 
   it("persists the run's failure reason on a failed plugin environment lease release", async () => {
