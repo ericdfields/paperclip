@@ -82,12 +82,34 @@ export function catalogCostCents(input: {
   return { costCents: Math.max(0, Math.ceil(cents)), pricingCatalogVersion: price.catalogVersion };
 }
 
+/**
+ * The cost a new event is stored with, and whether that number came from the
+ * provider or from the catalog.
+ *
+ * An estimate may replace an absence, never a charge. That is the precedence
+ * `repairableRowCondition` applies to historical rows, and the two paths have
+ * to agree: the writer prices exactly the rows the repair would price, and
+ * leaves alone exactly the rows the repair refuses to touch.
+ *
+ * - A `subscription_included` event costs zero by contract. Its zero is a fact,
+ *   not a gap, whatever status the caller stated beside it.
+ * - A number the provider named is a charge, including one that rounds to zero
+ *   at integer cents. `resolveLedgerCostStatus` writes `reported` whenever the
+ *   provider named a cost, so a `reported` zero is authoritative and an
+ *   estimate must not restate it.
+ * - What is left named no cost while it used tokens, which is the case the
+ *   catalog exists for. An unknown model stays unpriced rather than guessed.
+ */
 export function classifyCost(input: {
   provider: string; biller?: string | null; model: string; inputTokens: number; cachedInputTokens: number; outputTokens: number; costCents: number; billingType?: string | null; costStatus?: string | null;
 }) {
-  if (input.costStatus === "unpriced") return { costStatus: "unpriced" as const, pricingCatalogVersion: null, costCents: input.costCents };
-  if (input.billingType === "subscription_included") return { costStatus: "reported" as const, pricingCatalogVersion: null, costCents: 0 };
-  if (input.costCents > 0) return { costStatus: "reported" as const, pricingCatalogVersion: null, costCents: input.costCents };
+  const stated = {
+    costStatus: (input.costStatus === "unpriced" ? "unpriced" : "reported") as "unpriced" | "reported",
+    pricingCatalogVersion: null,
+    costCents: input.costCents,
+  };
+  if (input.billingType === "subscription_included") return { ...stated, costCents: 0 };
+  if (input.costCents > 0 || input.costStatus === "reported") return stated;
   const estimated = catalogCostCents(input);
   return estimated ? { costStatus: "reported" as const, ...estimated } : { costStatus: "unpriced" as const, pricingCatalogVersion: null, costCents: 0 };
 }

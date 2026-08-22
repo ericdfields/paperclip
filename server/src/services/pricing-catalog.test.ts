@@ -49,6 +49,48 @@ describe("pricing catalog", () => {
     })).toMatchObject({ costStatus: "unpriced", costCents: 0, pricingCatalogVersion: null });
   });
 
+  it("prices an event the provider did not price, and leaves a reported zero alone", () => {
+    // `resolveLedgerCostStatus` writes `unpriced` only when the provider named
+    // no cost while tokens were used. That is the case the catalog exists for,
+    // so the writer has to price it, exactly as the historical repair does.
+    expect(classifyCost({
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      outputTokens: 1_000_000,
+      costCents: 0,
+      costStatus: "unpriced",
+    })).toEqual({ costStatus: "reported", costCents: 1250, pricingCatalogVersion: PRICING_CATALOG_VERSION });
+
+    // A charge below half a cent rounds to zero and keeps the status `reported`.
+    // It is a number the provider named, so an estimate must not restate it.
+    expect(classifyCost({
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      outputTokens: 1_000_000,
+      costCents: 0,
+      costStatus: "reported",
+    })).toEqual({ costStatus: "reported", costCents: 0, pricingCatalogVersion: null });
+  });
+
+  it("keeps a subscription zero whatever status is stated beside it", () => {
+    for (const costStatus of ["reported", "unpriced"]) {
+      expect(classifyCost({
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        inputTokens: 1_000_000,
+        cachedInputTokens: 0,
+        outputTokens: 1_000_000,
+        costCents: 0,
+        billingType: "subscription_included",
+        costStatus,
+      })).toMatchObject({ costCents: 0, pricingCatalogVersion: null });
+    }
+  });
+
   it("prices an Anthropic event on disjoint counts and an OpenAI event on an inclusive one", () => {
     // Anthropic reports input_tokens and cache_read_input_tokens separately, so
     // 1,000,000 uncached at 300 plus 1,000,000 cached at 30 is 330 cents.
