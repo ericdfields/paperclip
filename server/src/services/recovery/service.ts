@@ -101,6 +101,16 @@ export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+
+/** The most recent of the given timestamps, ignoring any that are absent. */
+function latestTimestamp(...values: (Date | null | undefined)[]): Date | null {
+  let latest: Date | null = null;
+  for (const value of values) {
+    if (value && (latest === null || value.getTime() > latest.getTime())) latest = value;
+  }
+  return latest;
+}
+
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
@@ -5510,6 +5520,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           status: heartbeatRuns.status,
           contextSnapshot: heartbeatRuns.contextSnapshot,
           createdAt: heartbeatRuns.createdAt,
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+          updatedAt: heartbeatRuns.updatedAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(heartbeatRuns)
         .where(inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])),
@@ -5520,6 +5535,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           status: heartbeatRuns.status,
           issueId: issues.id,
           createdAt: heartbeatRuns.createdAt,
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+          updatedAt: heartbeatRuns.updatedAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(issues)
         .innerJoin(heartbeatRuns, eq(issues.executionRunId, heartbeatRuns.id))
@@ -5644,6 +5664,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       (Boolean(row.ownerAgentId) && liveRecoveryActionIds.has(row.id)),
     );
 
+    // A run is renewed by its own progress, never by the issue's clock. Output flushes and
+    // lifecycle writes both move the run row, and `scheduled_retry` is an execution status,
+    // so a run parked waiting for its next attempt is not silent — it is waiting by design.
+    // Ageing an execution path from `createdAt` alone would escalate both as dead paths
+    // purely for outlasting the bound, out from under a run that is still maintained.
+    const runLiveness = (row: {
+      startedAt: Date | null;
+      lastOutputAt: Date | null;
+      lastUsefulActionAt: Date | null;
+      updatedAt: Date;
+      scheduledRetryAt: Date | null;
+    }) => ({
+      lastActivityAt: latestTimestamp(
+        row.startedAt,
+        row.lastOutputAt,
+        row.lastUsefulActionAt,
+        row.updatedAt,
+      ),
+      waitingUntil: row.scheduledRetryAt,
+    });
+
     return classifyIssueGraphLiveness({
       issues: issueRows,
       relations: relationRows,
@@ -5654,12 +5695,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         status: row.status,
         issueId: issueIdFromRunContext(row.contextSnapshot),
         createdAt: row.createdAt,
+        ...runLiveness(row),
       })).concat(activeIssueRunRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
         issueId: row.issueId,
         createdAt: row.createdAt,
+        ...runLiveness(row),
       }))),
       queuedWakeRequests: wakeRows.map((row) => ({
         companyId: row.companyId,

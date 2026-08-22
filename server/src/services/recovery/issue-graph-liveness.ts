@@ -54,6 +54,19 @@ export interface IssueLivenessExecutionPathInput {
   agentId?: string | null;
   status: string;
   createdAt?: Date | string | null;
+  /**
+   * The most recent evidence that this row itself moved — output flushed, progress
+   * recorded, lifecycle advanced. Unlike the issue's `updatedAt`, every write to a run
+   * row *is* that run doing something, so this renews the path honestly. Absent, the
+   * path is aged from `createdAt` alone.
+   */
+  lastActivityAt?: Date | string | null;
+  /**
+   * A future time this path is deliberately waiting for, such as a scheduled retry.
+   * While it is ahead of now, the path is maintained by design and cannot be stale
+   * however old the row is.
+   */
+  waitingUntil?: Date | string | null;
 }
 
 export interface IssueLivenessWaitingPathInput {
@@ -234,6 +247,16 @@ function readDateMs(value: unknown): number | null {
   return Number.isNaN(time) ? null : time;
 }
 
+/** The most recent of the given timestamps, ignoring any that are absent or unparseable. */
+function latestDateMs(...values: (Date | string | null | undefined)[]): number | null {
+  let latest: number | null = null;
+  for (const value of values) {
+    const ms = readDateMs(value ?? null);
+    if (ms !== null && (latest === null || ms > latest)) latest = ms;
+  }
+  return latest;
+}
+
 function monitorFromIssue(issue: IssueLivenessIssueInput) {
   const policyMonitor = readRecord(readRecord(issue.executionPolicy)?.monitor);
   const stateMonitor = readRecord(readRecord(issue.executionState)?.monitor);
@@ -258,6 +281,14 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
 }
 
 /**
+ * Optional extra clocks a row-backed path can offer beyond the moment it was created.
+ */
+interface ReviewPathLiveness {
+  lastActivityAt?: Date | string | null;
+  waitingUntil?: Date | string | null;
+}
+
+/**
  * True when a path of this kind, last touched at `since`, has gone quiet for longer
  * than its kind allows.
  *
@@ -268,28 +299,37 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
  * `execution_participant`) are measured from `reviewTransitionAt`, the moment review
  * began.
  *
- * `updatedAt` is deliberately not a fallback here. It is refreshed by any comment or
- * unrelated edit, which made it both too harsh (a live run on a quiet issue read as
- * stale) and too generous (routine status comments — including the platform's own
- * re-triage sweeps — renewed a reviewer who had done nothing, indefinitely). An issue
- * with no clock at all is never called stale, so a caller that supplies neither keeps
- * the previous behaviour.
+ * The *issue's* `updatedAt` is deliberately not a fallback here. It is refreshed by any
+ * comment or unrelated edit, which made it both too harsh (a live run on a quiet issue
+ * read as stale) and too generous (routine status comments — including the platform's
+ * own re-triage sweeps — renewed a reviewer who had done nothing, indefinitely). An
+ * issue with no clock at all is never called stale, so a caller that supplies neither
+ * keeps the previous behaviour.
+ *
+ * A row's own progress is the opposite case and does renew it: `lastActivityAt` belongs
+ * to the path, not to the issue around it, so it cannot be moved by unrelated traffic.
+ * Creation time alone would expire a run that is still producing output, or one parked
+ * in a scheduled retry, purely for taking longer than the bound — `waitingUntil` covers
+ * the second, where the path is not quiet but deliberately waiting.
  */
 function isReviewPathStale(
   kind: IssueReviewPathFactKind,
   since: Date | string | null,
   issue: IssueLivenessIssueInput,
   nowMs: number,
+  liveness?: ReviewPathLiveness,
 ) {
   const staleAfterMs = REVIEW_PATH_STALE_AFTER_MS[kind];
   if (staleAfterMs === undefined) return false;
+  const waitingUntilMs = readDateMs(liveness?.waitingUntil ?? null);
+  if (waitingUntilMs !== null && waitingUntilMs > nowMs) return false;
   // A row-backed path is aged by its own row or not at all. If a caller does not supply
   // the timestamp, the honest reading is "unknown", and unknown must never resolve to
   // stale: that is how a running execution gets classified as a dead path and escalated
   // out from under itself.
   const sinceMs = REVIEW_PATH_KINDS_AGED_BY_REVIEW_CLOCK.has(kind)
     ? readDateMs(since) ?? readDateMs(issue.reviewTransitionAt)
-    : readDateMs(since);
+    : latestDateMs(since, liveness?.lastActivityAt ?? null);
   if (sinceMs === null) return false;
   return nowMs - sinceMs > staleAfterMs;
 }
@@ -302,8 +342,8 @@ export function classifyIssueReviewPaths(
   const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const paths: IssueReviewPathFact[] = [];
-  const push = (fact: Omit<IssueReviewPathFact, "stale">) => {
-    paths.push({ ...fact, stale: isReviewPathStale(fact.kind, fact.since, issue, nowMs) });
+  const push = (fact: Omit<IssueReviewPathFact, "stale">, liveness?: ReviewPathLiveness) => {
+    paths.push({ ...fact, stale: isReviewPathStale(fact.kind, fact.since, issue, nowMs, liveness) });
   };
 
   if (issue.assigneeUserId) {
@@ -352,13 +392,19 @@ export function classifyIssueReviewPaths(
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
-      push({
-        kind,
-        ref: entry.id ?? null,
-        agentId: entry.agentId ?? null,
-        userId: null,
-        since: entry.createdAt ?? null,
-      });
+      // `since` stays the moment the path came into being — that is what the board reads.
+      // Staleness is judged separately, so ongoing progress renews the path without
+      // rewriting when it started.
+      push(
+        {
+          kind,
+          ref: entry.id ?? null,
+          agentId: entry.agentId ?? null,
+          userId: null,
+          since: entry.createdAt ?? null,
+        },
+        { lastActivityAt: entry.lastActivityAt ?? null, waitingUntil: entry.waitingUntil ?? null },
+      );
     }
   };
   appendExecutionPaths(input.activeRuns ?? [], "active_run");

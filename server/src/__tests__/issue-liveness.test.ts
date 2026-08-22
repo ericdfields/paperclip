@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness } from "../services/issue-liveness.ts";
+import { classifyIssueReviewPaths } from "../services/recovery/issue-graph-liveness.ts";
+import type { IssueLivenessIssueInput } from "../services/issue-liveness.ts";
 
 const companyId = "company-1";
 const managerId = "manager-1";
@@ -802,6 +804,123 @@ describe("in_review action-path staleness", () => {
     );
 
     expect(findings).toEqual([]);
+  });
+
+  it("keeps a run that is still producing output live past the active-run bound", () => {
+    // Creation time is immutable, so a run that legitimately works for more than a day
+    // would age out mid-flight if it were the only clock. The run's own progress is what
+    // renews it — and unlike the issue's `updatedAt`, unrelated traffic cannot move it.
+    const findings = classify(
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          {
+            companyId,
+            issueId: reviewIssueId,
+            agentId: coderId,
+            status: "running",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            lastActivityAt: "2026-08-21T23:30:00.000Z",
+          },
+        ],
+      },
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("flags a run that has been silent past the bound however recently it was created", () => {
+    const findings = classify(
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          {
+            companyId,
+            issueId: reviewIssueId,
+            agentId: coderId,
+            status: "running",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            lastActivityAt: "2026-08-20T00:00:00.000Z",
+          },
+        ],
+      },
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain("active_run");
+  });
+
+  it("keeps a run parked in a scheduled retry live until that retry is due", () => {
+    // `scheduled_retry` is an execution status. Such a run is not quiet — it is waiting for
+    // a time the platform already set, and escalating it would fight its own retry.
+    const findings = classify(
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          {
+            companyId,
+            issueId: reviewIssueId,
+            agentId: coderId,
+            status: "scheduled_retry",
+            createdAt: "2026-08-15T00:00:00.000Z",
+            lastActivityAt: "2026-08-15T00:00:00.000Z",
+            waitingUntil: "2026-08-22T06:00:00.000Z",
+          },
+        ],
+      },
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("flags a scheduled retry whose due time has already passed", () => {
+    // The retry was supposed to fire and did not. Once the wait is behind us the row is
+    // silent again, and the bound applies exactly as it would to any other dead path.
+    const findings = classify(
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z"),
+      {
+        activeRuns: [
+          {
+            companyId,
+            issueId: reviewIssueId,
+            agentId: coderId,
+            status: "scheduled_retry",
+            createdAt: "2026-08-15T00:00:00.000Z",
+            lastActivityAt: "2026-08-15T00:00:00.000Z",
+            waitingUntil: "2026-08-16T00:00:00.000Z",
+          },
+        ],
+      },
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain("active_run");
+  });
+
+  it("reports when a renewed path began, not when it last moved", () => {
+    // `since` is the board's "waiting since" column. Renewing a path must not rewrite it,
+    // or a run stuck retrying for a week would read as freshly started every sweep.
+    const [path] = classifyIssueReviewPaths(
+      {
+        issues: [],
+        relations: [],
+        agents: [agent(), manager],
+        now,
+        activeRuns: [
+          {
+            companyId,
+            issueId: reviewIssueId,
+            agentId: coderId,
+            status: "running",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            lastActivityAt: "2026-08-21T23:30:00.000Z",
+          },
+        ],
+      },
+      agedReview({ assigneeUserId: null }, "2026-07-01T00:00:00.000Z") as IssueLivenessIssueInput,
+    );
+
+    expect(path).toMatchObject({ kind: "active_run", stale: false, since: "2026-08-19T00:00:00.000Z" });
   });
 
   it("never ages a row-backed path off the review clock when its own timestamp is missing", () => {
