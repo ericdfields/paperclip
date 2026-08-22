@@ -194,11 +194,10 @@ import {
 } from "./run-scratch.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
-  executionWorkspaceModeForReuse,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   issueExecutionWorkspaceModeForPersistence,
-  isExecutionWorkspaceIsolationDrift,
+  isExecutionWorkspaceModeDrift,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
@@ -4479,14 +4478,15 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   const existingWorkspaceMatchesRequestedBranch =
     requestedExistingBranch === null ||
     readNonEmptyString(input.existingExecutionWorkspaceBranchName) === requestedExistingBranch;
-  // A resolved mode that demands the issue's own tree outranks the reuse binding for the
-  // same reason: only the create path ever records a mode, so restoring a shared workspace
-  // would keep the run in the shared tree and silently discard the resolved mode on every
-  // run. Refusing here lets the create path realize it, which self-heals the binding without
-  // a data migration. Callers that do not resolve a mode keep the historical behaviour.
-  const isolationDrift =
+  // A resolved mode that demands the issue's own tree outranks the reuse binding: only the
+  // create path ever records a mode, so restoring a workspace realized under a different one
+  // would keep the run in that tree and silently discard the resolved mode on every run.
+  // Refusing here lets the create path realize it, which self-heals the binding without a data
+  // migration, and keeps this decision agreeing with the config-freshness one, which already
+  // treats `mode` as replacement-class. Callers that resolve no mode keep historical behaviour.
+  const modeDrift =
     input.resolvedExecutionWorkspaceMode != null &&
-    isExecutionWorkspaceIsolationDrift({
+    isExecutionWorkspaceModeDrift({
       resolvedMode: input.resolvedExecutionWorkspaceMode,
       existingWorkspaceMode: input.existingExecutionWorkspaceMode,
     });
@@ -4494,7 +4494,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     input.issueExecutionWorkspacePreference === "reuse_existing" &&
     requestedExecutionWorkspaceId !== null &&
     existingWorkspaceMatchesRequestedBranch &&
-    !isolationDrift;
+    !modeDrift;
 
   return {
     requestedExecutionWorkspaceId,
@@ -15180,20 +15180,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
     const branchNameForInitialPersistence =
       pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
-    // Only the create arm ever recorded a mode, so a restored workspace kept its original
-    // label even after the resolved mode moved on. Refusing reuse covers the shared -> private
-    // case; this covers the private -> private one, where the tree honors either mode and the
-    // label is the only thing left stale.
-    const reusedExecutionWorkspaceMode = reusableExistingExecutionWorkspace
-      ? executionWorkspaceModeForReuse({
-          resolvedMode: requestedExecutionWorkspaceMode,
-          existingWorkspaceMode: reusableExistingExecutionWorkspace.mode,
-        })
-      : null;
     try {
       persistedExecutionWorkspace = resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace
         ? await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
-            ...(reusedExecutionWorkspaceMode ? { mode: reusedExecutionWorkspaceMode } : {}),
             cwd: executionWorkspace.cwd,
             repoUrl: executionWorkspace.repoUrl,
             baseRef: executionWorkspace.repoRef,

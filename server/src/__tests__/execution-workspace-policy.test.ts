@@ -6,9 +6,8 @@ import {
 import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
-  executionWorkspaceModeForReuse,
   gateProjectExecutionWorkspacePolicy,
-  isExecutionWorkspaceIsolationDrift,
+  isExecutionWorkspaceModeDrift,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   issueExecutionWorkspaceModeForPersistence,
@@ -114,73 +113,57 @@ describe("execution workspace policy helpers", () => {
     ).toBe("agent_default");
   });
 
-  it("detects isolation drift only when the bound workspace cannot be the issue's own tree", () => {
+  it("detects mode drift whenever the bound workspace was not realized as the resolved mode", () => {
     for (const existingWorkspaceMode of ["shared_workspace", "adapter_managed", null, undefined]) {
       expect(
-        isExecutionWorkspaceIsolationDrift({ resolvedMode: "isolated_workspace", existingWorkspaceMode }),
+        isExecutionWorkspaceModeDrift({ resolvedMode: "isolated_workspace", existingWorkspaceMode }),
       ).toBe(true);
     }
-    for (const existingWorkspaceMode of ["isolated_workspace", "operator_branch", "cloud_sandbox"]) {
-      expect(
-        isExecutionWorkspaceIsolationDrift({ resolvedMode: "operator_branch", existingWorkspaceMode }),
-      ).toBe(false);
-    }
-    // Modes that never promise a private tree cannot drift into one.
-    for (const resolvedMode of ["shared_workspace", "agent_default"] as const) {
-      expect(
-        isExecutionWorkspaceIsolationDrift({ resolvedMode, existingWorkspaceMode: "shared_workspace" }),
-      ).toBe(false);
-    }
-  });
-
-  it("relabels a reused workspace between the two private modes and nowhere else", () => {
-    // isolated_workspace and operator_branch resolve the same strategy from the same config
-    // (resolveEffectiveWorkspaceStrategyType never branches on which of the two it is), so a
-    // tree realized as one honors the other — only the recorded label goes stale, and the
-    // reuse path is the only writer that can refresh it.
     expect(
-      executionWorkspaceModeForReuse({
+      isExecutionWorkspaceModeDrift({
         resolvedMode: "operator_branch",
-        existingWorkspaceMode: "isolated_workspace",
-      }),
-    ).toBe("operator_branch");
-    expect(
-      executionWorkspaceModeForReuse({
-        resolvedMode: "isolated_workspace",
-        existingWorkspaceMode: "operator_branch",
-      }),
-    ).toBe("isolated_workspace");
-    // Nothing to rewrite when the label already matches.
-    for (const mode of ["isolated_workspace", "operator_branch"] as const) {
-      expect(
-        executionWorkspaceModeForReuse({ resolvedMode: mode, existingWorkspaceMode: mode }),
-      ).toBeNull();
-    }
-    // A resolved mode that promises no private tree must not relabel a private one down to
-    // shared — that is the same DB lie pointing the other way.
-    for (const resolvedMode of ["shared_workspace", "agent_default"] as const) {
-      expect(
-        executionWorkspaceModeForReuse({ resolvedMode, existingWorkspaceMode: "isolated_workspace" }),
-      ).toBeNull();
-    }
-    // Shared -> private never reaches this helper (reuse is refused first), and must not
-    // relabel even if it did.
-    for (const existingWorkspaceMode of ["shared_workspace", "adapter_managed", null, undefined]) {
-      expect(
-        executionWorkspaceModeForReuse({ resolvedMode: "isolated_workspace", existingWorkspaceMode }),
-      ).toBeNull();
-    }
-  });
-
-  it("keeps reuse allowed across the two private modes rather than rebuilding the tree", () => {
-    // The relabel above is only safe because drift detection deliberately treats both private
-    // modes as one class. If this ever resolves to true, the relabel must become a recreate.
-    expect(
-      isExecutionWorkspaceIsolationDrift({
-        resolvedMode: "isolated_workspace",
         existingWorkspaceMode: "operator_branch",
       }),
     ).toBe(false);
+    // Modes that never promise a private tree keep the historical reuse behaviour.
+    for (const resolvedMode of ["shared_workspace", "agent_default"] as const) {
+      expect(
+        isExecutionWorkspaceModeDrift({ resolvedMode, existingWorkspaceMode: "shared_workspace" }),
+      ).toBe(false);
+      expect(
+        isExecutionWorkspaceModeDrift({ resolvedMode, existingWorkspaceMode: "isolated_workspace" }),
+      ).toBe(false);
+    }
+  });
+
+  it("treats a change between the two private modes as drift, not a reusable tree", () => {
+    // `mode` is replacement-class in heartbeat's WORKSPACE_REPLACEMENT_CONFIG_CATEGORIES, so
+    // config freshness already calls any mode change a `replace`. Reuse has to agree: if it
+    // restored the tree instead, shouldPersistLatestWorkspaceConfigMetadata would withhold the
+    // fresh fingerprint and the workspace would re-drift on every subsequent run forever.
+    expect(
+      isExecutionWorkspaceModeDrift({
+        resolvedMode: "isolated_workspace",
+        existingWorkspaceMode: "operator_branch",
+      }),
+    ).toBe(true);
+    expect(
+      isExecutionWorkspaceModeDrift({
+        resolvedMode: "operator_branch",
+        existingWorkspaceMode: "isolated_workspace",
+      }),
+    ).toBe(true);
+    // A cloud sandbox is private but is still not the mode that was resolved.
+    expect(
+      isExecutionWorkspaceModeDrift({
+        resolvedMode: "isolated_workspace",
+        existingWorkspaceMode: "cloud_sandbox",
+      }),
+    ).toBe(true);
+    // Same mode is the one reusable case.
+    for (const mode of ["isolated_workspace", "operator_branch"] as const) {
+      expect(isExecutionWorkspaceModeDrift({ resolvedMode: mode, existingWorkspaceMode: mode })).toBe(false);
+    }
   });
 
   it("resolves shared-workspace concurrency from issue override, project policy, then auto", () => {

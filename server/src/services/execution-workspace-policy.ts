@@ -351,56 +351,30 @@ export function issueExecutionWorkspaceModeForPersistence(input: {
 }
 
 /**
- * Whether a persisted execution workspace gives its issue a tree no other issue runs in.
- * `shared_workspace` and `adapter_managed` (the agent's own home cwd) are shared by
- * construction, and an unrecorded mode cannot be proven private — only a worktree, an
- * operator branch, or a per-run cloud sandbox is genuinely the issue's own.
+ * True when the freshly resolved mode promises the issue a tree of its own and the workspace
+ * it is bound to was not realized as that same mode. Reusing such a binding would run the
+ * issue in a tree realized under a different mode while every downstream record claims the
+ * resolved one, so the reuse path refuses and the create path realizes what was resolved.
+ *
+ * The comparison is exact rather than "is it private enough", because `mode` is a member of
+ * `WORKSPACE_REPLACEMENT_CONFIG_CATEGORIES` in heartbeat.ts: the config-freshness machinery
+ * already classifies *any* mode change as replacement-class. Accepting reuse across two
+ * private modes would contradict that — the freshness decision says `replace` while
+ * provisioning restores, and `shouldPersistLatestWorkspaceConfigMetadata` then withholds the
+ * fresh fingerprint, so the workspace re-drifts on every subsequent run forever. Refusing
+ * here keeps the two decisions saying the same thing, and the create path persists metadata
+ * that matches the mode it actually realized.
+ *
+ * Modes that do not promise a private tree keep the historical reuse behaviour.
  */
-function persistedExecutionWorkspaceIsolatesTree(mode: string | null | undefined): boolean {
-  return mode === "isolated_workspace" || mode === "operator_branch" || mode === "cloud_sandbox";
-}
-
-/**
- * True when the freshly resolved mode promises the issue a tree of its own but the workspace
- * it is bound to is a shared one. Reusing that binding would run the issue in the shared tree
- * while every downstream record claims it is isolated, so the reuse path refuses and the
- * create path realizes the mode that was actually resolved.
- */
-export function isExecutionWorkspaceIsolationDrift(input: {
+export function isExecutionWorkspaceModeDrift(input: {
   resolvedMode: ParsedExecutionWorkspaceMode;
   existingWorkspaceMode: string | null | undefined;
 }): boolean {
   if (input.resolvedMode !== "isolated_workspace" && input.resolvedMode !== "operator_branch") {
     return false;
   }
-  return !persistedExecutionWorkspaceIsolatesTree(input.existingWorkspaceMode);
-}
-
-/**
- * The mode to record on an execution workspace the reuse path restores, or `null` to leave
- * the recorded mode alone.
- *
- * The reuse path never wrote a mode at all, so a restored workspace kept the label of
- * whichever mode first created it. `isExecutionWorkspaceIsolationDrift` already refuses
- * reuse when the resolved mode wants a private tree and the bound workspace is a shared
- * one, so the relabel left to do is between the two private modes: `isolated_workspace`
- * and `operator_branch` resolve the same strategy from the same config
- * (`resolveEffectiveWorkspaceStrategyType` never branches on which of the two it is), so
- * the restored tree honors either and only the label is stale.
- *
- * A resolved mode that does not promise a private tree keeps the recorded mode: rewriting
- * a physically private worktree to `shared_workspace` would be the same DB lie this fix
- * exists to prevent, just pointing the other way.
- */
-export function executionWorkspaceModeForReuse(input: {
-  resolvedMode: ParsedExecutionWorkspaceMode;
-  existingWorkspaceMode: string | null | undefined;
-}): "isolated_workspace" | "operator_branch" | null {
-  if (input.resolvedMode !== "isolated_workspace" && input.resolvedMode !== "operator_branch") {
-    return null;
-  }
-  if (!persistedExecutionWorkspaceIsolatesTree(input.existingWorkspaceMode)) return null;
-  return input.existingWorkspaceMode === input.resolvedMode ? null : input.resolvedMode;
+  return input.existingWorkspaceMode !== input.resolvedMode;
 }
 
 export function resolveExecutionWorkspaceMode(input: {

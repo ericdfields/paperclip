@@ -7,7 +7,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
-import { executionWorkspaceModeForReuse } from "../services/execution-workspace-policy.ts";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -1843,10 +1842,13 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("reuses the private tree across an isolated_workspace -> operator_branch flip, relabelled", () => {
-    // Both private modes realize through the same strategy, so rebuilding the tree on a flip
-    // would cost a worktree for nothing. Reuse stands; the stale label is what gets fixed, and
-    // it is fixed on the reuse path because the create arm is the only other writer of `mode`.
+  it("refuses reuse across an isolated_workspace -> operator_branch flip", () => {
+    // `mode` is replacement-class, so config freshness already classifies this flip as a
+    // `replace`. resolveExecutionWorkspaceReuseProvisioningPolicy takes
+    // shouldRestoreExistingWorkspace straight from the reuse request and never consults that
+    // action, so if reuse said "restore" the run would keep the tree realized under the old
+    // mode while replacementClassDrift withheld the fresh fingerprint — re-drifting forever.
+    // Refusing keeps the two decisions in agreement.
     expect(resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-private",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1855,15 +1857,40 @@ describe("effective run execution workspace config freshness", () => {
       existingExecutionWorkspaceMode: "isolated_workspace",
     })).toEqual({
       requestedExecutionWorkspaceId: "workspace-private",
-      requestedShouldReuseExisting: true,
-      existingExecutionWorkspaceAvailable: true,
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
     });
-    expect(
-      executionWorkspaceModeForReuse({
-        resolvedMode: "operator_branch",
-        existingWorkspaceMode: "isolated_workspace",
-      }),
-    ).toBe("operator_branch");
+  });
+
+  it("keeps the reuse decision agreeing with a replacement-class freshness decision", () => {
+    // The invariant the flip above protects: whenever reuse is granted, provisioning restores
+    // unconditionally, so a granted reuse must never coexist with a `replace` freshness action
+    // on the mode category.
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-private",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      resolvedExecutionWorkspaceMode: "isolated_workspace",
+      existingExecutionWorkspaceMode: "operator_branch",
+    });
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+      workspaceConfigFreshness: {
+        action: "replace",
+        shouldReuseExisting: false,
+        shouldRefreshConfigSnapshot: false,
+        reasons: ["execution workspace configuration changed: mode"],
+        changedCategories: ["mode"],
+        storedFingerprint: "old",
+        inferredFingerprint: null,
+        nextFingerprint: "new",
+        storedFingerprintPresent: true,
+      },
+    });
+    expect(policy.shouldRestoreExistingWorkspace).toBe(false);
+    // With reuse refused there is no replacement-class drift to suppress persistence, so the
+    // create path records metadata that matches the mode it realized.
+    expect(policy.shouldPersistLatestWorkspaceConfigMetadata).toBe(true);
   });
 
   it("keeps reusing a shared workspace when the resolved mode is still shared", () => {
