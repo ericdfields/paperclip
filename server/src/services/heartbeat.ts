@@ -1198,6 +1198,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
   // ("OpenAI API key is missing"), so a configuration fault is recorded as
   // `adapter_failed`. A grant is not proof of delivery; this is the check that
   // makes the run prove it, before dispatch, naming keys and never values.
+  //
+  // The low-trust boundary is carried through: a run can only be required to
+  // hold a credential it is allowed to hold. Demanding delivery of a binding
+  // outside `allowedSecretBindingIds` would abort a run that is correctly
+  // withholding it.
   if (input.secretsSvc.collectUndeliveredEnvBindings) {
     const deliveredEnvKeys = Object.keys(parseObject(resolvedConfig.env));
     const undelivered: MissingRuntimeBinding[] = [];
@@ -1213,6 +1218,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
           input.companyId,
           consumer,
           deliveredEnvKeys,
+          { allowedBindingIds: lowTrustAllowedBindingIds ?? null },
         )),
       );
     }

@@ -3,6 +3,7 @@ import {
   ConfigurationIncompleteFailure,
   resolveExecutionRunAdapterConfig,
 } from "../services/heartbeat.ts";
+import { LOW_TRUST_REVIEW_PRESET } from "../services/trust-preset-resolver.ts";
 
 /**
  * BRO-2367 — a grant is not proof of delivery.
@@ -70,6 +71,7 @@ describe("resolveExecutionRunAdapterConfig delivery gate", () => {
       "company-1",
       { consumerType: "agent", consumerId: "agent-1" },
       [],
+      { allowedBindingIds: null },
     );
   });
 
@@ -111,8 +113,48 @@ describe("resolveExecutionRunAdapterConfig delivery gate", () => {
       "company-1",
       { consumerType: "agent", consumerId: "agent-1" },
       ["OPENAI_API_KEY"],
+      { allowedBindingIds: null },
     );
     expect(result.resolvedConfig.env).toMatchObject({ OPENAI_API_KEY: "resolved" });
+  });
+
+  /**
+   * A low-trust run is deliberately narrowed to `allowedSecretBindingIds`. A
+   * binding outside that boundary is one the run must NOT receive — resolution
+   * rejects it as `binding_not_allowed` when the config declares it. If the gate
+   * demanded delivery of it anyway, a run that is correctly withholding the
+   * credential would abort as `configuration_incomplete`.
+   */
+  it("carries the low-trust boundary into the gate so a forbidden binding is not required", async () => {
+    const collectUndeliveredEnvBindings = vi.fn().mockResolvedValue([]);
+
+    await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: { env: {} },
+      trustPreset: {
+        kind: "low_trust_review",
+        preset: LOW_TRUST_REVIEW_PRESET,
+        boundary: {
+          mode: LOW_TRUST_REVIEW_PRESET,
+          companyId: "company-1",
+          issueIds: ["issue-1"],
+          allowedSecretBindingIds: ["binding-1"],
+        },
+        sourcePresets: {},
+      } as any,
+      secretsSvc: {
+        ...passThroughSecretsSvc({}),
+        collectUndeliveredEnvBindings,
+      } as any,
+    });
+
+    expect(collectUndeliveredEnvBindings).toHaveBeenCalledWith(
+      "company-1",
+      { consumerType: "agent", consumerId: "agent-1" },
+      [],
+      { allowedBindingIds: ["binding-1"] },
+    );
   });
 
   it("checks every consumer scope that contributed env to the run", async () => {

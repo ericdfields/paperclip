@@ -80,7 +80,7 @@ describeEmbeddedPostgres("secretService.collectUndeliveredEnvBindings", () => {
       value: "sk-test-never-logged",
     });
     const agentId = randomUUID();
-    await db.insert(companySecretBindings).values(
+    const bindings = await db.insert(companySecretBindings).values(
       configPaths.map((configPath) => ({
         companyId,
         secretId: secret.id,
@@ -89,8 +89,8 @@ describeEmbeddedPostgres("secretService.collectUndeliveredEnvBindings", () => {
         configPath,
         required,
       })),
-    );
-    return { companyId, agentId, secretId: secret.id, secrets };
+    ).returning();
+    return { companyId, agentId, secretId: secret.id, secrets, bindings };
   }
 
   it("reports a granted env binding whose key is absent from the run env", async () => {
@@ -164,5 +164,48 @@ describeEmbeddedPostgres("secretService.collectUndeliveredEnvBindings", () => {
         [],
       ),
     ).resolves.toEqual([]);
+  });
+
+  it("ignores a binding outside the low-trust boundary, which the run must not receive", async () => {
+    const { companyId, agentId, secrets } = await seed(["env.OPENAI_API_KEY"]);
+
+    await expect(
+      secrets.collectUndeliveredEnvBindings(
+        companyId,
+        { consumerType: "agent", consumerId: agentId },
+        [],
+        { allowedBindingIds: [randomUUID()] },
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it("still reports a binding inside the low-trust boundary", async () => {
+    const { companyId, agentId, secrets, bindings } = await seed(["env.OPENAI_API_KEY"]);
+
+    await expect(
+      secrets.collectUndeliveredEnvBindings(
+        companyId,
+        { consumerType: "agent", consumerId: agentId },
+        [],
+        { allowedBindingIds: bindings.map((binding) => binding.id) },
+      ),
+    ).resolves.toEqual([
+      expect.objectContaining({ configPath: "env.OPENAI_API_KEY", errorCode: "binding_not_delivered" }),
+    ]);
+  });
+
+  it("requires every binding when no boundary is in effect", async () => {
+    const { companyId, agentId, secrets } = await seed(["env.OPENAI_API_KEY"]);
+
+    await expect(
+      secrets.collectUndeliveredEnvBindings(
+        companyId,
+        { consumerType: "agent", consumerId: agentId },
+        [],
+        { allowedBindingIds: null },
+      ),
+    ).resolves.toEqual([
+      expect.objectContaining({ configPath: "env.OPENAI_API_KEY" }),
+    ]);
   });
 });
