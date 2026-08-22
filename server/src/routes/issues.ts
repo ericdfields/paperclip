@@ -2864,10 +2864,11 @@ export function issueRoutes(
     unblockDescriptor?: IssueUnblockDescriptor | null;
     blockedTransitionAt?: Date | null;
     blockedOwnerNotifiedAt?: Date | null;
-  }): Promise<Date | null> {
+  }, supersedesNotifiedAt: Date | null = null): Promise<Date | null> {
     let ownerNotifiedAt: Date | null = null;
     await deliverAgentUnblockNotification({
       issue,
+      supersedesNotifiedAt,
       wakeup: heartbeat.wakeup,
       markNotified: async (blockedOwnerNotifiedAt) => {
         ownerNotifiedAt = blockedOwnerNotifiedAt;
@@ -10075,12 +10076,15 @@ export function issueRoutes(
     if (enteringBlocked || descriptorRepointedWhileBlocked) {
       const blockedIssue = issue;
       // A re-point is a fresh obligation for a different owner, so the prior
-      // delivery stamp must not suppress it; the fingerprint in the wakeup's
-      // idempotency key is what keeps genuine retries deduplicated.
+      // delivery stamp must not suppress it. That stamp is still what makes the
+      // new wakeup's key distinct: `blockedTransitionAt` does not move on a
+      // re-point, so without it a descriptor re-pointed A -> B -> A would
+      // rebuild the key A's first delivery already used.
       const ownerNotifiedAt = await notifyBlockedOwner(
         descriptorRepointedWhileBlocked
           ? { ...blockedIssue, blockedOwnerNotifiedAt: null }
           : blockedIssue,
+        descriptorRepointedWhileBlocked ? (blockedIssue.blockedOwnerNotifiedAt ?? null) : null,
       );
       if (ownerNotifiedAt) {
         issue = { ...blockedIssue, blockedOwnerNotifiedAt: ownerNotifiedAt };
