@@ -466,6 +466,60 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(rows[0]?.status).toBe("released");
   });
 
+  it("persists the run's failure reason on a failed local lease release", async () => {
+    const { companyId, environment, runId } = await seedEnvironment();
+
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    const released = await runtime.releaseRunLeases(
+      runId,
+      "failed",
+      undefined,
+      "adapter exited with code 137",
+    );
+
+    expect(released).toHaveLength(1);
+    expect(released[0]?.lease.failureReason).toBe("adapter exited with code 137");
+
+    // The row itself must carry the reason. A value that lives only in the
+    // activity log is exactly the leak this guards against.
+    const rows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, acquired.lease.id));
+    expect(rows[0]?.status).toBe("failed");
+    expect(rows[0]?.failureReason).toBe("adapter exited with code 137");
+    expect(rows[0]?.cleanupStatus).toBe("success");
+  });
+
+  it("invents no failure reason when a local lease is released cleanly", async () => {
+    const { companyId, environment, runId } = await seedEnvironment();
+
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await runtime.releaseRunLeases(runId);
+
+    const rows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, acquired.lease.id));
+    expect(rows[0]?.status).toBe("released");
+    expect(rows[0]?.failureReason).toBeNull();
+    expect(rows[0]?.cleanupStatus).toBe("success");
+  });
+
   it("allows projectless runs through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment();
 
