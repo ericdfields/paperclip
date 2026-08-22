@@ -283,16 +283,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
       !capabilityResolutionFailed &&
       (!effectiveCapabilities ||
         (effectiveCapabilities.nativeSyncIn && effectiveCapabilities.nativeSyncOut));
-    // The persistent-session output-streaming path needs the provider to keep a
-    // persistent process session AND to run independent one-shot control
-    // commands beside the long-lived agent command. When the snapshot removes
-    // either capability, drop back to the host output-file poll path. When the
-    // resolution failed, fail closed and keep the poll path too.
-    const sessionOutputStreamingAllowed =
-      !capabilityResolutionFailed &&
-      (!effectiveCapabilities ||
-        (effectiveCapabilities.persistentProcessSessions &&
-          effectiveCapabilities.independentControlCommands));
     // A command that opts onto the persistent session needs the provider to keep
     // persistent process sessions. When the snapshot removes that capability,
     // never force the session; the command runs one-shot instead. When the
@@ -315,13 +305,11 @@ export async function resolveEnvironmentExecutionTarget(input: {
       // output reaches the UI mid-run; `streamRunLogs: false` is an explicit
       // opt-out back to batch-at-end delivery.
       streamRunLogs: parsed.config.streamRunLogs !== false,
-      // Interactive ACP output streaming through the persistent session log
-      // stream. Default OFF: the process session bridge keeps the output-file
-      // poll unless an operator opts a sandbox environment in. The effective
-      // snapshot gates it too: a provider that cannot keep persistent process
-      // sessions or run independent control commands keeps the poll path.
-      streamAgentSessionOutput:
-        parsed.config.streamAgentSessionOutput === true && sessionOutputStreamingAllowed,
+      // Interactive ACP output streaming is decided downstream from the effective
+      // capability snapshot alone: the process session bridge streams only when
+      // the provider keeps persistent process sessions and runs independent
+      // control commands. The snapshot is absent when resolution failed, so the
+      // bridge fails closed to the output-file poll.
       runner: input.environmentRuntime && input.lease
         ? {
             // Provider-backed sandbox RPCs do not surface bounded mid-stream
@@ -329,6 +317,12 @@ export async function resolveEnvironmentExecutionTarget(input: {
             // here. The client falls back to the chunked upload path when this is
             // false.
             supportsSingleStreamStdinProgress: false,
+            // Carry the verified concurrent-sync opt-in to the sync client. The
+            // client copies it onto the native path and ignores it on the base64
+            // fallback, which always permits concurrency. A null snapshot or a
+            // provider that never opted in keeps it false, so an unverified
+            // provider never permits concurrent sync operations.
+            allowConcurrentSyncOperations: effectiveCapabilities?.concurrentSyncOperations === true,
             execute: async (commandInput) => {
               // Record true start and stop timestamps around the provider await,
               // so the exec span and the result carry a real wall time.
@@ -508,6 +502,21 @@ export async function resolveEnvironmentExecutionTarget(input: {
                       environment: input.environment as Environment,
                       lease: input.lease!,
                       operations,
+                    }),
+                }
+              : {}),
+            // Expose the duplex channel only when the effective snapshot grants
+            // the opt-in `duplexCommandStream` capability. A null snapshot
+            // (resolution failed or the snapshot is not resolvable) leaves the
+            // member undefined, so the caller keeps the file bridge. This mirrors
+            // the syncIn/syncOut gate above and fails closed.
+            ...(effectiveCapabilities?.duplexCommandStream
+              ? {
+                  openDuplexChannel: (channelInput) =>
+                    input.environmentRuntime!.openDuplexChannel({
+                      environment: input.environment as Environment,
+                      lease: input.lease!,
+                      command: channelInput.command,
                     }),
                 }
               : {}),

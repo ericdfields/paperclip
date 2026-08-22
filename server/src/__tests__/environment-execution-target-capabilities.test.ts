@@ -18,6 +18,11 @@ const SNAPSHOT: EffectiveSandboxCapabilities = {
   nativeSyncOut: false,
   persistentProcessSessions: true,
   independentControlCommands: false,
+  incrementalSessionOutput: false,
+  // Concurrent sync operations need BOTH sync verbs; this snapshot verified only
+  // inbound sync, so the opt-in stays off.
+  concurrentSyncOperations: false,
+  duplexCommandStream: false,
 };
 
 // A snapshot that grants every capability. A test overrides one flag to prove
@@ -28,6 +33,9 @@ const FULL_GRANT: EffectiveSandboxCapabilities = {
   nativeSyncOut: true,
   persistentProcessSessions: true,
   independentControlCommands: true,
+  incrementalSessionOutput: true,
+  concurrentSyncOperations: true,
+  duplexCommandStream: true,
 };
 
 // Build a sandbox execution target with a fixed snapshot and a fixed
@@ -183,36 +191,84 @@ describe("effective snapshot gates the sync decision", () => {
   });
 });
 
-describe("effective snapshot gates the session-output-streaming decision", () => {
+// The execution target carries the concurrent-sync opt-in on both the effective
+// snapshot and the runner. The runner Boolean feeds the sync client, which then
+// tells the orchestrator whether it may run sync operations concurrently.
+describe("effective snapshot carries the concurrent-sync capability", () => {
   beforeEach(() => {
     mockResolveEnvironmentDriverConfigForRuntime.mockReset();
   });
 
-  it("keeps session output streaming on when the snapshot grants both session capabilities", async () => {
-    const { target } = await buildSandboxTarget({
-      snapshot: FULL_GRANT,
-      supportsSync: false,
-      config: { streamAgentSessionOutput: true },
-    });
-    expect(target.streamAgentSessionOutput).toBe(true);
+  it("carries the concurrent-sync opt-in on the snapshot and the runner", async () => {
+    const { target } = await buildSandboxTarget({ snapshot: FULL_GRANT, supportsSync: true });
+    expect(target.effectiveCapabilities?.concurrentSyncOperations).toBe(true);
+    expect(target.runner?.allowConcurrentSyncOperations).toBe(true);
   });
 
-  it("drops session output streaming when the snapshot removes persistent process sessions", async () => {
+  it("keeps the concurrent-sync opt-in off when the snapshot removes it", async () => {
     const { target } = await buildSandboxTarget({
-      snapshot: { ...FULL_GRANT, persistentProcessSessions: false },
-      supportsSync: false,
-      config: { streamAgentSessionOutput: true },
+      snapshot: { ...FULL_GRANT, concurrentSyncOperations: false },
+      supportsSync: true,
     });
-    expect(target.streamAgentSessionOutput).toBe(false);
+    expect(target.effectiveCapabilities?.concurrentSyncOperations).toBe(false);
+    expect(target.runner?.allowConcurrentSyncOperations).toBe(false);
   });
 
-  it("drops session output streaming when the snapshot removes independent control commands", async () => {
+  it("keeps the concurrent-sync opt-in off when the resolution rejects", async () => {
+    // A rejected resolution carries no snapshot; it must not read as an open
+    // grant. The runner keeps the opt-in off.
     const { target } = await buildSandboxTarget({
-      snapshot: { ...FULL_GRANT, independentControlCommands: false },
-      supportsSync: false,
-      config: { streamAgentSessionOutput: true },
+      snapshot: null,
+      supportsSync: true,
+      rejectResolution: true,
     });
-    expect(target.streamAgentSessionOutput).toBe(false);
+    expect(target.effectiveCapabilities).toBeUndefined();
+    expect(target.runner?.allowConcurrentSyncOperations).toBe(false);
+  });
+});
+
+// Session-output streaming is decided downstream from the carried snapshot
+// alone (see `streamAgentSessionOutput` in `acpx-engine/execute.ts`): the bridge
+// streams only when the snapshot grants `incrementalSessionOutput`. That key is
+// opt-in, so a generic one-shot provider that keeps persistent process sessions
+// and runs independent control commands, yet never declares incremental session
+// output, keeps the poll path. These tests prove the target carries the exact
+// capability that drives that decision.
+describe("effective snapshot carries the session-output-streaming capability", () => {
+  beforeEach(() => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockReset();
+  });
+
+  it("carries incremental session output when the snapshot grants it (stream on)", async () => {
+    const { target } = await buildSandboxTarget({ snapshot: FULL_GRANT, supportsSync: false });
+    expect(target.effectiveCapabilities?.incrementalSessionOutput).toBe(true);
+  });
+
+  it("drops incremental session output when the snapshot removes it (poll)", async () => {
+    const { target } = await buildSandboxTarget({
+      snapshot: { ...FULL_GRANT, incrementalSessionOutput: false },
+      supportsSync: false,
+    });
+    expect(target.effectiveCapabilities?.incrementalSessionOutput).toBe(false);
+  });
+
+  it("keeps the poll path for a generic one-shot provider with broad caps but no streaming opt-in", async () => {
+    // The regression case: a generic one-shot provider (for example Modal)
+    // exposes the two broad session capabilities but never emits incremental
+    // session output. The streaming gate reads `incrementalSessionOutput`, so
+    // this provider keeps the poll path.
+    const { target } = await buildSandboxTarget({
+      snapshot: {
+        ...FULL_GRANT,
+        persistentProcessSessions: true,
+        independentControlCommands: true,
+        incrementalSessionOutput: false,
+      },
+      supportsSync: false,
+    });
+    expect(target.effectiveCapabilities?.persistentProcessSessions).toBe(true);
+    expect(target.effectiveCapabilities?.independentControlCommands).toBe(true);
+    expect(target.effectiveCapabilities?.incrementalSessionOutput).toBe(false);
   });
 });
 
@@ -257,16 +313,16 @@ describe("a rejected capability resolution fails closed for persistent-session b
     expect(target.effectiveCapabilities).toBeUndefined();
   });
 
-  it("drops session output streaming when the resolution rejects", async () => {
+  it("carries no snapshot for session-output streaming when the resolution rejects", async () => {
     // A rejected resolution must not read as an open grant that enables
-    // streaming; keep the host output-file poll path.
+    // streaming. The target carries no snapshot, so the bridge keeps the host
+    // output-file poll path.
     const { target } = await buildSandboxTarget({
       snapshot: null,
       supportsSync: false,
-      config: { streamAgentSessionOutput: true },
       rejectResolution: true,
     });
-    expect(target.streamAgentSessionOutput).toBe(false);
+    expect(target.effectiveCapabilities).toBeUndefined();
   });
 
   it("never forces the persistent session when the resolution rejects", async () => {

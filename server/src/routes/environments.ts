@@ -11,6 +11,7 @@ import {
   resolveDeclaredSandboxCapabilities,
   redactEnvironmentCustomImageSetupSession,
   redactEnvironmentCustomImageTemplate,
+  relinkEnvironmentCustomImageTemplateSchema,
   startEnvironmentCustomImageSetupSessionSchema,
   type EnvironmentDeleteBlastRadius,
   updateEnvironmentSchema,
@@ -583,6 +584,12 @@ export function environmentRoutes(
     if (impact.staticReferences.isInstanceDefault) {
       return "Cannot delete the current instance default environment. Set a new default environment before deleting this one.";
     }
+    if (impact.pendingCleanupLeaseCount > 0) {
+      return "Cannot delete this environment while a sandbox cleanup is pending. Wait for the cleanup sweep to destroy the orphan sandbox, then retry.";
+    }
+    if (impact.reusableSandboxLeaseCount > 0) {
+      return "Cannot delete this environment while it has a reusable sandbox lease. Remove the associated execution workspace or issue so Paperclip can destroy the sandbox, then retry.";
+    }
     return null;
   }
 
@@ -735,6 +742,7 @@ export function environmentRoutes(
             templateRefKind: driver.templateRefKind,
             templateConfigBinding: driver.templateConfigBinding,
             supportsTemplateDelete: driver.supportsTemplateDelete,
+            supportsLoginPty: driver.supportsLoginPty ?? false,
             displayName: driver.displayName,
             description: driver.description,
             source: "plugin" as const,
@@ -945,6 +953,31 @@ export function environmentRoutes(
     res.json(result);
   });
 
+  router.post(
+    "/environments/:environmentId/custom-image-template/relink",
+    validate(relinkEnvironmentCustomImageTemplateSchema),
+    async (req, res) => {
+      assertCanAccessInstanceEnvironments(req);
+      const companyId = await resolveCustomImageCompanyId(req);
+      const actor = getActorInfo(req);
+      // The service classifies drift, re-stamps the fingerprint, and writes the
+      // activity row in one transaction. The route never classifies.
+      const result = await customImages.relinkActiveTemplate({
+        environmentId: req.params.environmentId as string,
+        confirmBootSourceDrift: req.body.confirmBootSourceDrift === true,
+        actor: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+        },
+        companyId,
+      });
+      res.json(result);
+    },
+  );
+
   router.delete("/environments/:environmentId/custom-image-template", async (req, res) => {
     assertCanAccessInstanceEnvironments(req);
     const companyId = await resolveCustomImageCompanyId(req);
@@ -1089,6 +1122,27 @@ export function environmentRoutes(
         }),
     });
     assertNoClientPlatformProvisionedMarkers(req.body.metadata);
+    // The durable `pending_cleanup` lease row stores the provider, the provider
+    // lease id, and the immutable config metadata for an orphan sandbox. The
+    // teardown retry reads that row alone and never reads the current environment
+    // provider. So a provider change or an environment delete after the record
+    // lands cannot strand the teardown. That immutable record is the correctness
+    // invariant.
+    //
+    // This pre-transaction check is a best-effort fast-fail only. It rejects a
+    // provider change while a known `pending_cleanup` lease exists, so the
+    // operator resolves the cleanup first. An orphan record that lands after this
+    // check still carries its own immutable teardown context, so the
+    // time-of-check-to-time-of-use window here cannot strand a sandbox.
+    const changesProviderTarget =
+      (req.body.driver !== undefined && req.body.driver !== existing.driver) ||
+      req.body.config !== undefined;
+    if (changesProviderTarget && (await svc.hasUnresolvedPendingCleanupLeases(existing.id))) {
+      throw conflict(
+        "Cannot change the driver or provider config while a sandbox cleanup is pending. Wait for the cleanup sweep to destroy the orphan sandbox, then retry.",
+        { code: "environment_pending_sandbox_cleanup" },
+      );
+    }
     const actor = getActorInfo(req);
     const nextDriver = req.body.driver ?? existing.driver;
     const nextName = req.body.name ?? existing.name;

@@ -56,6 +56,18 @@ import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
+export function postedIssueCommentLogMarker(method: string, requestPath: string, status: number, body: string) {
+  if (method !== "POST" || !/^\/api\/issues\/[^/]+\/comments$/.test(requestPath) || status < 200 || status >= 300) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(body) as { id?: unknown };
+    return typeof parsed.id === "string" && parsed.id.length > 0 ? `comment id: ${parsed.id}\n` : null;
+  } catch {
+    return null;
+  }
+}
+
 export type AdapterWorkspaceRealizationMode = "copy" | "in_place";
 
 export interface AdapterWorkspacePathAlias {
@@ -102,6 +114,9 @@ export interface EffectiveSandboxCapabilities {
   readonly nativeSyncOut: boolean;
   readonly persistentProcessSessions: boolean;
   readonly independentControlCommands: boolean;
+  readonly incrementalSessionOutput: boolean;
+  readonly concurrentSyncOperations: boolean;
+  readonly duplexCommandStream: boolean;
 }
 
 export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
@@ -127,13 +142,6 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * set to `false` to explicitly opt out back to batch-at-end delivery.
    */
   streamRunLogs?: boolean | null;
-  /**
-   * Stream the interactive ACP agent output through the persistent session log
-   * stream instead of the host-side output-file poll. The process session
-   * bridge runs the agent as one long-lived session command and reads its
-   * output frames from the stream. Default OFF: the bridge keeps the poll path.
-   */
-  streamAgentSessionOutput?: boolean | null;
 }
 
 export type AdapterExecutionTarget =
@@ -247,6 +255,9 @@ function parseEffectiveSandboxCapabilities(value: unknown): EffectiveSandboxCapa
     nativeSyncOut: parsed.nativeSyncOut === true,
     persistentProcessSessions: parsed.persistentProcessSessions === true,
     independentControlCommands: parsed.independentControlCommands === true,
+    incrementalSessionOutput: parsed.incrementalSessionOutput === true,
+    concurrentSyncOperations: parsed.concurrentSyncOperations === true,
+    duplexCommandStream: parsed.duplexCommandStream === true,
   };
 }
 
@@ -633,7 +644,7 @@ export async function runAdapterExecutionTargetProcess(
     const env = sanitizeRemoteExecutionEnv(options.env);
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
-      message: "Starting adapter in sandbox",
+      message: "Starting adapter in environment",
     });
     const runLogTail = options.runLogTail?.create() ?? null;
     let execCommand = command;
@@ -2308,10 +2319,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
           );
         }
+        const responseBody = await readBridgeForwardResponseBody(response, maxBodyBytes);
+        const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
+        if (commentMarker) await onLog("stdout", commentMarker);
         return {
           status: response.status,
           headers: buildBridgeResponseHeaders(response),
-          body: await readBridgeForwardResponseBody(response, maxBodyBytes),
+          body: responseBody,
         };
       },
     });
