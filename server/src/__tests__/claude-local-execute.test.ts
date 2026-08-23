@@ -85,6 +85,21 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
   await fs.chmod(commandPath, 0o755);
 }
 
+async function writeCostReportingClaudeCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+console.log(JSON.stringify({
+  type: "result",
+  subtype: "success",
+  session_id: "22222222-2222-4222-8222-222222222222",
+  result: "hello",
+  total_cost_usd: 0.70105,
+  usage: { input_tokens: 139590, cache_read_input_tokens: 0, output_tokens: 124 },
+}));
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -409,6 +424,37 @@ describe("claude execute", () => {
       expect(zero.mcpConfigPath).toBeNull();
       expect(zero.mcpConfigContents).toBeNull();
       expect(alpha.mcpConfigPath).toContain("/agents/agent-alpha/");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes gateway-reported cost from accounting and result projections", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-gateway-cost-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root);
+    await writeCostReportingClaudeCommand(commandPath);
+    try {
+      const result = await execute({
+        runId: "run-gateway-cost",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          env: { ANTHROPIC_BASE_URL: "https://openrouter.ai/api" },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+        onMeta: async () => {},
+      });
+
+      expect(result.costSource).toBe("untrusted");
+      expect(result.costUsd).toBeNull();
+      expect(result.usage).toMatchObject({ inputTokens: 139590, outputTokens: 124 });
+      expect(result.resultJson).not.toHaveProperty("total_cost_usd");
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });

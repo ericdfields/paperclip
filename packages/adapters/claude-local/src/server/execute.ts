@@ -1203,6 +1203,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
     };
+    if (!reportedCostTrusted) {
+      delete mergedResultJson.total_cost_usd;
+    }
 
     return {
       exitCode: proc.exitCode,
