@@ -14,7 +14,12 @@ import type {
   SandboxEnvironmentConfig,
   SandboxProviderCapabilities,
 } from "@paperclipai/shared";
-import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
+import {
+  resolveDeclaredSandboxCapabilities,
+  DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS,
+  MAX_IN_PROCESS_RUN_LEASE_TTL_HOURS,
+  MIN_IN_PROCESS_RUN_LEASE_TTL_HOURS,
+} from "@paperclipai/shared";
 import type { EffectiveSandboxCapabilities } from "@paperclipai/adapter-utils/execution-target";
 import type {
   CommandManagedDuplexChannel,
@@ -432,6 +437,14 @@ export interface EnvironmentDriverAcquireInput {
    * behavior.
    */
   requestedExpiresAt?: Date | null;
+  /**
+   * The instance-configured TTL for a lease held by a driver with no
+   * provider-side lease of its own (`local`, `ssh`), in hours. Resolved once by
+   * the runtime so a driver never reads settings itself. Absent or invalid
+   * falls back to `DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS`; ignored entirely
+   * when the caller supplies its own `requestedExpiresAt`.
+   */
+  inProcessLeaseTtlHours?: number | null;
   /**
    * Re-check the environment company binding inside the lease insert
    * transaction. The login acquire paths set this so a managed reconciliation
@@ -1009,23 +1022,48 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+const HOUR_MS = 60 * 60 * 1000;
+
 /**
  * How long an in-process run lease (local, ssh) stays valid when nothing
- * releases it.
+ * releases it, absent an instance override.
  *
- * The value is not a guess at how long a run takes. It is the point past which
- * recovery itself stops believing a silent run is alive — the same four hours
- * as `ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS` in `recovery/service.ts`. Before
- * that boundary a lease still plausibly belongs to live work; after it, either
- * recovery has already terminalized the run (which releases the lease through
- * the normal path) or nothing ever will.
+ * Six hours against a longest-observed run of about two and a half. The margin
+ * matters less than it looks: the expired-lease sweep releases a lease only
+ * when the run holding it is *also* terminal, so this value cannot cut a live
+ * run's environment out from under it however tight it gets set. What it
+ * actually controls is how long an abandoned lease lingers before collection —
+ * a detection bound, not a kill switch.
  *
- * Deliberately not imported from `recovery/service.js`: this module sits below
- * recovery in the dependency order and must stay there. The two values are
- * pinned together by an assertion in `environment-runtime.test.ts` instead, so
- * a change to one fails the suite rather than drifting silently.
+ * That separation is the whole design. A TTL-only reaper would recreate the
+ * state-leak class this work exists to close, from the other direction: instead
+ * of leases that never end, leases that end while their run is still using
+ * them.
  */
-export const IN_PROCESS_RUN_LEASE_TTL_MS = 4 * 60 * 60 * 1000;
+export const DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS =
+  DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS * HOUR_MS;
+
+export const MIN_IN_PROCESS_RUN_LEASE_TTL_MS = MIN_IN_PROCESS_RUN_LEASE_TTL_HOURS * HOUR_MS;
+export const MAX_IN_PROCESS_RUN_LEASE_TTL_MS = MAX_IN_PROCESS_RUN_LEASE_TTL_HOURS * HOUR_MS;
+
+/**
+ * The configured in-process lease TTL, in milliseconds.
+ *
+ * Clamped rather than rejected. The schema already bounds what can be written
+ * through the settings API, so an out-of-range value here means a row written
+ * by an older build or edited directly — cases where refusing to acquire a
+ * lease would take runs down over a tuning value. Clamping keeps the instance
+ * running on the nearest legal bound.
+ */
+export function resolveInProcessRunLeaseTtlMs(hours: number | null | undefined): number {
+  if (typeof hours !== "number" || !Number.isFinite(hours)) {
+    return DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS;
+  }
+  return Math.min(
+    MAX_IN_PROCESS_RUN_LEASE_TTL_MS,
+    Math.max(MIN_IN_PROCESS_RUN_LEASE_TTL_MS, Math.round(hours * HOUR_MS)),
+  );
+}
 
 /**
  * The expiry to stamp on a lease held by a driver with no provider-side lease
@@ -1037,7 +1075,7 @@ export const IN_PROCESS_RUN_LEASE_TTL_MS = 4 * 60 * 60 * 1000;
 function inProcessRunLeaseExpiry(input: EnvironmentDriverAcquireInput, now: Date = new Date()): Date {
   return input.requestedExpiresAt instanceof Date && !Number.isNaN(input.requestedExpiresAt.getTime())
     ? input.requestedExpiresAt
-    : new Date(now.getTime() + IN_PROCESS_RUN_LEASE_TTL_MS);
+    : new Date(now.getTime() + resolveInProcessRunLeaseTtlMs(input.inProcessLeaseTtlHours));
 }
 
 /**
@@ -3242,6 +3280,27 @@ export function environmentRuntimeService(
     return driver;
   }
 
+  /**
+   * The instance's configured in-process lease TTL, read once per acquisition.
+   *
+   * A settings read must never be what stops a run from starting, so a failure
+   * here falls back to the default instead of propagating. Losing the override
+   * costs a lease a longer or shorter collection window; losing the lease costs
+   * the run.
+   */
+  async function readInProcessLeaseTtlHours(): Promise<number> {
+    try {
+      const experimental = await instanceSettingsService(db).getExperimental();
+      return experimental.inProcessRunLeaseTtlHours;
+    } catch (err) {
+      logger.warn(
+        { err },
+        "failed to read the configured in-process lease TTL; using the default",
+      );
+      return DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS;
+    }
+  }
+
   return {
     getDriver,
 
@@ -3295,6 +3354,7 @@ export function environmentRuntimeService(
       });
       const driver = requireDriver(input.environment);
       const lease = await driver.acquireRunLease({
+        inProcessLeaseTtlHours: await readInProcessLeaseTtlHours(),
         companyId: input.companyId,
         environment: input.environment,
         issueId: input.issueId,

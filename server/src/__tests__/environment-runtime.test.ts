@@ -30,12 +30,17 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.ts";
 import {
-  IN_PROCESS_RUN_LEASE_TTL_MS,
+  DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS,
+  MAX_IN_PROCESS_RUN_LEASE_TTL_MS,
+  MIN_IN_PROCESS_RUN_LEASE_TTL_MS,
+  resolveInProcessRunLeaseTtlMs,
   SANDBOX_CAPABILITY_KEYS,
   environmentRuntimeService,
   findReusableSandboxLeaseId,
   SandboxOrphanCleanupWriteError,
 } from "../services/environment-runtime.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
+import { DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS } from "@paperclipai/shared";
 import { ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS } from "../services/recovery/service.ts";
 import * as sandboxProviderRuntime from "../services/sandbox-provider-runtime.ts";
 import * as environmentsModule from "../services/environments.ts";
@@ -6408,8 +6413,48 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       .then((rows) => rows[0]);
     expect(row?.expiresAt).toBeInstanceOf(Date);
     const expiresAt = row!.expiresAt!.getTime();
-    expect(expiresAt).toBeGreaterThanOrEqual(before + IN_PROCESS_RUN_LEASE_TTL_MS);
-    expect(expiresAt).toBeLessThanOrEqual(after + IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(expiresAt).toBeGreaterThanOrEqual(before + DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(expiresAt).toBeLessThanOrEqual(after + DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+  });
+
+  it("stamps the instance-configured TTL instead of the default when one is set", async () => {
+    const { companyId, environment, runId } = await seedEnvironment({ driver: "local" });
+
+    // The override is the point of the setting: an operator whose runs are
+    // longer (or whose collection window should be tighter) tunes this without
+    // a code change. Twelve hours is deliberately not the 6h default, so a
+    // regression that ignores the setting cannot pass this by coincidence.
+    const expectedTtlMs = 12 * 60 * 60 * 1000;
+    expect(expectedTtlMs).not.toBe(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+    await instanceSettingsService(db).updateExperimental({ inProcessRunLeaseTtlHours: 12 });
+
+    try {
+      const before = Date.now();
+      const acquired = await runtime.acquireRunLease({
+        companyId,
+        environment,
+        issueId: null,
+        heartbeatRunId: runId,
+        persistedExecutionWorkspace: null,
+      });
+      const after = Date.now();
+
+      const row = await db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, acquired.lease.id))
+        .then((rows) => rows[0]);
+      const expiresAt = row!.expiresAt!.getTime();
+      expect(expiresAt).toBeGreaterThanOrEqual(before + expectedTtlMs);
+      expect(expiresAt).toBeLessThanOrEqual(after + expectedTtlMs);
+    } finally {
+      // The settings row outlives this test's fixtures -- it is instance-wide,
+      // not company-scoped, so `afterEach` never clears it. Leaving 12h set
+      // would silently re-tune every later acquisition in this file.
+      await instanceSettingsService(db).updateExperimental({
+        inProcessRunLeaseTtlHours: DEFAULT_IN_PROCESS_RUN_LEASE_TTL_HOURS,
+      });
+    }
   });
 
   it("honours a caller-supplied lease expiry instead of the default TTL", async () => {
@@ -6435,12 +6480,29 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(row?.expiresAt?.getTime()).toBe(requestedExpiresAt.getTime());
   });
 
-  // The TTL is deliberately the point past which recovery stops believing a
-  // silent run is alive. It is duplicated rather than imported, because
-  // environment-runtime sits below recovery in the dependency order -- so this
-  // assertion is what stops the two drifting apart.
-  it("pins the in-process lease TTL to the recovery critical threshold", () => {
-    expect(IN_PROCESS_RUN_LEASE_TTL_MS).toBe(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+  // The default outlasts recovery's own patience with a silent run. By the time
+  // a lease can expire, recovery has already had its say about the run holding
+  // it -- so an expired lease with a still-live run is a state the sweep should
+  // never have to reason about, and the sweep's terminal-run guard is a second
+  // lock on a door that is already shut.
+  it("defaults the in-process lease TTL past the recovery critical threshold", () => {
+    expect(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS).toBeGreaterThan(
+      ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+    );
+  });
+
+  it("clamps a configured TTL to the supported bounds instead of refusing it", () => {
+    // The settings schema already rejects out-of-range writes, so a value that
+    // reaches here came from an older build or a hand-edited row. Refusing it
+    // would fail every lease acquisition -- taking runs down over a tuning
+    // value -- so the resolver floors and caps instead.
+    expect(resolveInProcessRunLeaseTtlMs(6)).toBe(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(0)).toBe(MIN_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(-40)).toBe(MIN_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(10_000)).toBe(MAX_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(Number.NaN)).toBe(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(null)).toBe(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
+    expect(resolveInProcessRunLeaseTtlMs(undefined)).toBe(DEFAULT_IN_PROCESS_RUN_LEASE_TTL_MS);
   });
 
   it("persists the run's failure reason on a failed plugin environment lease release", async () => {
