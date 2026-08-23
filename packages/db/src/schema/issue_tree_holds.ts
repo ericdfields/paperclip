@@ -1,4 +1,6 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import type { IssueTreeHoldStatus } from "@paperclipai/shared";
+import { check, index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -11,7 +13,7 @@ export const issueTreeHolds = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     rootIssueId: uuid("root_issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
     mode: text("mode").notNull(),
-    status: text("status").notNull().default("active"),
+    status: text("status").$type<IssueTreeHoldStatus>().notNull().default("active"),
     reason: text("reason"),
     releasePolicy: jsonb("release_policy").$type<Record<string, unknown>>(),
     createdByActorType: text("created_by_actor_type").notNull().default("system"),
@@ -29,6 +31,7 @@ export const issueTreeHolds = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    statusCheck: check("issue_tree_holds_status_check", sql`${table.status} in ('active', 'released')`),
     companyRootStatusIdx: index("issue_tree_holds_company_root_status_idx").on(
       table.companyId,
       table.rootIssueId,

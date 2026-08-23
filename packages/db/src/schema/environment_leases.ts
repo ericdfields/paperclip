@@ -1,4 +1,6 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import type { EnvironmentLeaseCleanupStatus, EnvironmentLeaseStatus } from "@paperclipai/shared";
+import { check, index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { environments } from "./environments.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
@@ -21,7 +23,7 @@ export const environmentLeases = pgTable(
     executionWorkspaceId: uuid("execution_workspace_id").references(() => executionWorkspaces.id, { onDelete: "set null" }),
     issueId: uuid("issue_id").references(() => issues.id, { onDelete: "set null" }),
     heartbeatRunId: uuid("heartbeat_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
-    status: text("status").notNull().default("active"),
+    status: text("status").$type<EnvironmentLeaseStatus>().notNull().default("active"),
     leasePolicy: text("lease_policy").notNull().default("ephemeral"),
     provider: text("provider"),
     providerLeaseId: text("provider_lease_id"),
@@ -30,12 +32,20 @@ export const environmentLeases = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     failureReason: text("failure_reason"),
-    cleanupStatus: text("cleanup_status"),
+    cleanupStatus: text("cleanup_status").$type<EnvironmentLeaseCleanupStatus>(),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    statusCheck: check(
+      "environment_leases_status_check",
+      sql`${table.status} in ('active', 'released', 'expired', 'failed', 'retained', 'pending_cleanup')`,
+    ),
+    cleanupStatusCheck: check(
+      "environment_leases_cleanup_status_check",
+      sql`${table.cleanupStatus} in ('pending', 'success', 'failed')`,
+    ),
     companyEnvironmentStatusIdx: index("environment_leases_company_environment_status_idx").on(
       table.companyId,
       table.environmentId,

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
+import type { WakeupRequestStatus } from "@paperclipai/shared";
+import { check, pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -13,7 +14,7 @@ export const agentWakeupRequests = pgTable(
     triggerDetail: text("trigger_detail"),
     reason: text("reason"),
     payload: jsonb("payload").$type<Record<string, unknown>>(),
-    status: text("status").notNull().default("queued"),
+    status: text("status").$type<WakeupRequestStatus>().notNull().default("queued"),
     coalescedCount: integer("coalesced_count").notNull().default(0),
     requestedByActorType: text("requested_by_actor_type"),
     requestedByActorId: text("requested_by_actor_id"),
@@ -27,6 +28,10 @@ export const agentWakeupRequests = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    statusCheck: check(
+      "agent_wakeup_requests_status_check",
+      sql`${table.status} in ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'skipped', 'completed', 'failed', 'cancelled')`,
+    ),
     companyAgentStatusIdx: index("agent_wakeup_requests_company_agent_status_idx").on(
       table.companyId,
       table.agentId,
