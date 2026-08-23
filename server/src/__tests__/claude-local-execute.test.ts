@@ -8,6 +8,7 @@ import {
   claudeCommandSupportsEffortFlag,
   claudeSessionCwdMatchesExecutionTarget,
   execute,
+  isClaudeReportedCostTrusted,
   resetClaudeCliCapabilitiesCacheForTests,
 } from "@paperclipai/adapter-claude-local/server";
 
@@ -348,6 +349,17 @@ function createLocalSandboxRunner() {
     },
   };
 }
+
+describe("Claude reported cost trust", () => {
+  it("trusts only the default or Anthropic-owned messages endpoint", () => {
+    expect(isClaudeReportedCostTrusted({})).toBe(true);
+    expect(
+      isClaudeReportedCostTrusted({ ANTHROPIC_BASE_URL: "https://api.anthropic.com" }),
+    ).toBe(true);
+    expect(isClaudeReportedCostTrusted({ ANTHROPIC_BASE_URL: "https://openrouter.ai/api" })).toBe(false);
+    expect(isClaudeReportedCostTrusted({ ANTHROPIC_BASE_URL: "not a url" })).toBe(false);
+  });
+});
 
 describe("claude execute", () => {
   it("uses a strict per-agent MCP config only when managed servers are present", async () => {

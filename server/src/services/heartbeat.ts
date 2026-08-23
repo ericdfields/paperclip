@@ -16450,6 +16450,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
               }),
+              costSource: adapterResult.costSource === "untrusted" ? "untrusted" : "reported",
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
