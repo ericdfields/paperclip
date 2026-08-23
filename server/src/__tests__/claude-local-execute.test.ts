@@ -440,6 +440,7 @@ describe("claude execute", () => {
         agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { ANTHROPIC_BASE_URL: "https://openrouter.ai/api" },
@@ -841,7 +842,7 @@ describe("claude execute", () => {
       expect(result.errorMessage).toBeNull();
       expect(result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
       expect(result.usageBasis).toBe("per_run");
-      expect(result.costUsd).toBeNull();
+      expect(result.costUsd).toBe(0);
       expect(loggedCommand).toBe(commandPath);
       expect(loggedEnv.HOME).toBe(root);
       expect(loggedEnv.CLAUDE_CONFIG_DIR).toBe(claudeConfigDir);
