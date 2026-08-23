@@ -2,6 +2,7 @@ import type { ReactElement, ReactNode } from "react";
 import { Loader2, ShieldCheck, Terminal, TriangleAlert } from "lucide-react";
 import { BOOTSTRAP_FALLBACK_COMMAND } from "@/bootstrapSetup";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 
 type LabFixtureKey =
   | "signed-out-private"
@@ -51,7 +52,7 @@ function CliFallback({ hasActiveInvite }: { hasActiveInvite: boolean }) {
 function StateChrome({ children }: { children: ReactNode }) {
   return (
     <div className="mx-auto max-w-xl py-10">
-      <div className="rounded-lg border border-border bg-card p-6">{children}</div>
+      <Card className="block p-6">{children}</Card>
     </div>
   );
 }
@@ -142,7 +143,7 @@ function ClaimErrorPrivate() {
           <p className="font-medium">Someone else has already claimed this instance.</p>
           <p className="mt-1 text-destructive/90">
             Refresh to sign in, or ask the existing admin to invite you from{" "}
-            <span className="font-mono">Instance settings → Access</span>.
+            <span className="font-mono">Settings → Access</span>.
           </p>
         </div>
       </div>

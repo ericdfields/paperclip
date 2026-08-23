@@ -17,7 +17,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
 }
-
 function humanize(value: string) {
   return value.replaceAll("_", " ");
 }
@@ -228,7 +227,7 @@ export function InstanceSettings() {
                       >
                         <Badge
                           variant={agent.schedulerActive ? "default" : "outline"}
-                          className="shrink-0 text-[10px] px-1.5 py-0"
+                          className="shrink-0 text-(length:--text-nano) px-1.5 py-0"
                         >
                           {agent.schedulerActive ? "On" : "Off"}
                         </Badge>

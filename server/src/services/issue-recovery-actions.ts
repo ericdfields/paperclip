@@ -35,12 +35,16 @@ export type UpsertIssueRecoveryActionInput = {
   maxAttempts?: number | null;
   timeoutAt?: Date | null;
   lastAttemptAt?: Date | null;
+  attemptCount?: number;
 };
 
 export type ResolveIssueRecoveryActionInput = {
   companyId: string;
   sourceIssueId: string;
   actionId?: string | null;
+  kind?: IssueRecoveryActionKind | null;
+  cause?: string | null;
+  fingerprint?: string | null;
   status: Extract<IssueRecoveryActionStatus, "resolved" | "cancelled">;
   outcome: IssueRecoveryActionOutcome;
   resolutionNote?: string | null;
@@ -120,8 +124,12 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
-  async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
+  async function getActiveForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -196,7 +204,7 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: existing.attemptCount + 1,
+          attemptCount: input.attemptCount ?? existing.attemptCount + 1,
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
@@ -238,7 +246,7 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: 1,
+          attemptCount: input.attemptCount ?? 1,
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
@@ -269,6 +277,15 @@ export function issueRecoveryActionService(db: Db) {
     ];
     if (input.actionId) {
       predicates.push(eq(issueRecoveryActions.id, input.actionId));
+    }
+    if (input.kind) {
+      predicates.push(eq(issueRecoveryActions.kind, input.kind));
+    }
+    if (input.cause) {
+      predicates.push(eq(issueRecoveryActions.cause, input.cause));
+    }
+    if (input.fingerprint) {
+      predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
     const [updated] = await dbOrTx
