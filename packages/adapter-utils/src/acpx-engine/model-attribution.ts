@@ -11,6 +11,66 @@ export interface AcpxEffectiveModel {
   source: AcpxModelSource;
 }
 
+interface AcpxSelectOption {
+  value?: unknown;
+  name?: unknown;
+  description?: unknown;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readClaudeModelFamily(value: string): string | null {
+  const match = value.match(/\b(opus|sonnet|haiku|fable|mythos)\b/i);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function readClaudeModelVersion(value: string): string | null {
+  const match = value.match(/\b(?:opus|sonnet|haiku|fable|mythos)\s+(\d+(?:\.\d+)*)\b/i);
+  return match?.[1]?.replaceAll(".", "-") ?? null;
+}
+
+/**
+ * Resolve a Claude ACP picker value to the concrete model described by the
+ * server's model config option. Claude's ACP server intentionally exposes
+ * semantic values such as `default`, `sonnet`, and `opus[1m]`; their option
+ * metadata carries the resolved family/version (for example "Opus 4.8 with 1M
+ * context"). Reading that metadata avoids a hard-coded alias table that would
+ * silently go stale the next time Claude's default advances.
+ */
+export function resolveClaudeAcpModelId(
+  status: AcpRuntimeStatus | null | undefined,
+  selectedModelId: string,
+): string | null {
+  const details = asRecord(status?.details);
+  const configOptions = details?.configOptions;
+  if (!Array.isArray(configOptions)) return null;
+
+  const modelOption = configOptions
+    .map(asRecord)
+    .find((option) => option?.id === "model");
+  if (!modelOption || !Array.isArray(modelOption.options)) return null;
+
+  const selected = modelOption.options
+    .map(asRecord)
+    .find((option): option is Record<string, unknown> => option?.value === selectedModelId);
+  if (!selected) return null;
+
+  const option = selected as AcpxSelectOption;
+  const text = [option.name, option.description]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+  const family = readClaudeModelFamily(text);
+  const version = readClaudeModelVersion(text);
+  if (!family || !version) return null;
+
+  const contextSuffix = /\b1m\b/i.test(`${selectedModelId} ${text}`) ? "[1m]" : "";
+  return `claude-${family}-${version}${contextSuffix}`;
+}
+
 /**
  * Read the concrete model id the ACP session reports it is running, or null
  * when the session only offers a placeholder. `AcpRuntimeStatus.models` is
@@ -23,10 +83,19 @@ export interface AcpxEffectiveModel {
  * selected; the runtime also normalizes a missing id to the empty string.
  * Neither identifies the model a turn ran on, so neither is returned here.
  */
-export function readAcpxSessionModelId(status: AcpRuntimeStatus | null | undefined): string | null {
+export function readAcpxSessionModelId(
+  status: AcpRuntimeStatus | null | undefined,
+  acpxAgent?: string,
+): string | null {
   const currentModelId = status?.models?.currentModelId;
-  if (isPlaceholderModelId(currentModelId)) return null;
-  return (currentModelId as string).trim();
+  if (typeof currentModelId !== "string" || !currentModelId.trim()) return null;
+  const trimmed = currentModelId.trim();
+  if (acpxAgent === "claude") {
+    const resolved = resolveClaudeAcpModelId(status, trimmed);
+    if (resolved) return resolved;
+  }
+  if (isPlaceholderModelId(trimmed)) return null;
+  return trimmed;
 }
 
 /**
@@ -52,9 +121,11 @@ export function resolveAcpxEffectiveModel(input: {
   postStatus?: AcpRuntimeStatus | null;
   preStatus?: AcpRuntimeStatus | null;
   requestedModel?: string | null;
+  acpxAgent?: string;
 }): AcpxEffectiveModel {
   const sessionModel =
-    readAcpxSessionModelId(input.postStatus) ?? readAcpxSessionModelId(input.preStatus);
+    readAcpxSessionModelId(input.postStatus, input.acpxAgent) ??
+    readAcpxSessionModelId(input.preStatus, input.acpxAgent);
   if (sessionModel) return { model: sessionModel, source: "session" };
 
   const requested = typeof input.requestedModel === "string" ? input.requestedModel.trim() : "";

@@ -3890,7 +3890,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // than echoed from the request so runs that leave `config.model` unset are
       // still attributable. Seeded with the request so a failure before the
       // pre-turn snapshot still reports what it can.
-      let effectiveModel = resolveAcpxEffectiveModel({ requestedModel: prepared.requestedModel });
+      let effectiveModel = resolveAcpxEffectiveModel({
+        requestedModel: prepared.requestedModel,
+        acpxAgent: prepared.acpxAgent,
+      });
       // Phase-timing markers for the prepare_turn and turn phases. The prepare
       // phase covers the prompt build and the pre-turn usage snapshot; the turn
       // phase covers the started turn and the event relay.
@@ -3965,6 +3968,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         effectiveModel = resolveAcpxEffectiveModel({
           preStatus: preTurnStatus,
           requestedModel: prepared.requestedModel,
+          acpxAgent: prepared.acpxAgent,
         });
         // The prepare phase (prompt build + usage snapshot) finished; the turn
         // phase starts next.
@@ -4023,6 +4027,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           postStatus: postTurnStatus,
           preStatus: preTurnStatus,
           requestedModel: prepared.requestedModel,
+          acpxAgent: prepared.acpxAgent,
         });
         const turnUsage = summarizeAcpxTurnUsage({
           preStatus: preTurnStatus,

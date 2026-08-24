@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { AcpRuntimeStatus } from "acpx/runtime";
 
-import { readAcpxSessionModelId, resolveAcpxEffectiveModel } from "./model-attribution.js";
+import {
+  readAcpxSessionModelId,
+  resolveAcpxEffectiveModel,
+  resolveClaudeAcpModelId,
+} from "./model-attribution.js";
 
 function statusWithModel(currentModelId: string | undefined): AcpRuntimeStatus {
   return {
@@ -11,6 +15,50 @@ function statusWithModel(currentModelId: string | undefined): AcpRuntimeStatus {
     },
   } as AcpRuntimeStatus;
 }
+
+function claudeStatus(currentModelId: string): AcpRuntimeStatus {
+  return {
+    models: { currentModelId, availableModelIds: ["default", "opus[1m]", "sonnet", "haiku"] },
+    details: {
+      configOptions: [
+        {
+          id: "model",
+          type: "select",
+          currentValue: currentModelId,
+          options: [
+            {
+              value: "default",
+              name: "Default (recommended)",
+              description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+            },
+            {
+              value: "opus[1m]",
+              name: "Opus",
+              description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+            },
+            { value: "sonnet", name: "Sonnet", description: "Sonnet 5 · Efficient for routine tasks" },
+            { value: "haiku", name: "Haiku", description: "Haiku 4.5 · Fastest for quick answers" },
+          ],
+        },
+      ],
+    },
+  } as AcpRuntimeStatus;
+}
+
+describe("resolveClaudeAcpModelId", () => {
+  it.each([
+    ["default", "claude-opus-4-8[1m]"],
+    ["opus[1m]", "claude-opus-4-8[1m]"],
+    ["sonnet", "claude-sonnet-5"],
+    ["haiku", "claude-haiku-4-5"],
+  ])("canonicalizes the Claude ACP picker value %s", (selected, expected) => {
+    expect(resolveClaudeAcpModelId(claudeStatus(selected), selected)).toBe(expected);
+  });
+
+  it("does not guess when the ACP server omits resolved family/version metadata", () => {
+    expect(resolveClaudeAcpModelId(statusWithModel("sonnet"), "sonnet")).toBeNull();
+  });
+});
 
 describe("readAcpxSessionModelId", () => {
   it("returns the concrete model id the session reports", () => {
@@ -37,6 +85,14 @@ describe("readAcpxSessionModelId", () => {
   it("returns null when currentModelId is not a string", () => {
     const status = { models: { currentModelId: 42, availableModelIds: [] } } as unknown as AcpRuntimeStatus;
     expect(readAcpxSessionModelId(status)).toBeNull();
+  });
+
+  it("resolves Claude's default picker to its canonical model from config metadata", () => {
+    expect(readAcpxSessionModelId(claudeStatus("default"), "claude")).toBe("claude-opus-4-8[1m]");
+  });
+
+  it("canonicalizes Claude's semantic aliases from config metadata", () => {
+    expect(readAcpxSessionModelId(claudeStatus("sonnet"), "claude")).toBe("claude-sonnet-5");
   });
 });
 
@@ -68,6 +124,12 @@ describe("resolveAcpxEffectiveModel", () => {
         preStatus: statusWithModel("claude-fable-5[1m]"),
       }),
     ).toEqual({ model: "claude-fable-5[1m]", source: "session" });
+  });
+
+  it("attributes an unconfigured Claude run to the concrete default advertised by its ACP server", () => {
+    expect(
+      resolveAcpxEffectiveModel({ postStatus: claudeStatus("default"), acpxAgent: "claude" }),
+    ).toEqual({ model: "claude-opus-4-8[1m]", source: "session" });
   });
 
   it("falls back to the requested model when no session model state exists", () => {
