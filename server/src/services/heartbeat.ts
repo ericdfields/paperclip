@@ -161,6 +161,7 @@ import { projectService } from "./projects.js";
 import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
+import { mcpGatewayApiEndpointPath } from "./mcp-gateway-endpoints.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
@@ -3475,7 +3476,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     });
     servers.push({
       name: connection.name,
-      url: `${paperclipApiBaseUrl()}/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      url: `${paperclipApiBaseUrl()}${mcpGatewayApiEndpointPath(gateway.id)}`,
       token: token.token,
       connectionId: connection.id,
     });
@@ -3573,7 +3574,7 @@ async function createManagedMcpRunConfig(input: {
     managedGateways.push({
       id: gateway.id,
       name: gateway.name,
-      endpointPath: `/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      endpointPath: mcpGatewayApiEndpointPath(gateway.id),
       bearerToken: token.token,
       tokenPrefix: token.tokenPrefix,
     });
