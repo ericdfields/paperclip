@@ -13935,6 +13935,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reconcileStallCutoffReassignments() {
+    return recovery.reconcileStallCutoffReassignments(new Date());
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -19773,6 +19777,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+
+      const stallCutoff = await reconcileStallCutoffReassignments();
+      if (stallCutoff.reassigned > 0) {
+        logger.warn({ ...stallCutoff }, "stall-cutoff sweep auto-reassigned stalled issues");
+      }
 
       return {
         checked: checked + issueMonitors.checked,
